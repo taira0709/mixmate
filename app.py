@@ -18,9 +18,10 @@ import pyloudnorm as pyln
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
-# Configure for large file uploads
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB limit
-app.config['UPLOAD_TIMEOUT'] = 300  # 5 minutes timeout
+# Configure for large file uploads and memory optimization
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB limit (reduced for stability)
+app.config['UPLOAD_TIMEOUT'] = 600  # 10 minutes timeout
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 300  # Cache timeout
 
 # Error handler for large files
 @app.errorhandler(413)
@@ -1791,29 +1792,48 @@ def upload():
     if file_size > app.config['MAX_CONTENT_LENGTH']:
         return abort(413, f'File too large. Maximum size: {app.config["MAX_CONTENT_LENGTH"] / 1024 / 1024:.0f}MB')
 
-    # Generate file ID from file content (for smaller files) or filename + size for large files
-    if file_size < 10 * 1024 * 1024:  # For files < 10MB, use content hash
-        raw = file.read()
-        file.seek(0)  # Reset file pointer
-        fid = _make_file_id(raw)
-    else:  # For large files, use filename + size hash to avoid loading in memory
-        import hashlib
-        fid = hashlib.sha1(f"{file.filename}_{file_size}".encode()).hexdigest()[:16]
+    # Always use filename + size + timestamp for file ID to avoid memory issues
+    import hashlib
+    import time as time_mod
+    fid = hashlib.sha1(f"{file.filename}_{file_size}_{time_mod.time()}".encode()).hexdigest()[:16]
 
     if fid not in FILES:
-        # Save to temporary file instead of keeping in memory
+        # Save to temporary file using streaming (no memory loading)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
-            file.save(temp_file.name)
             temp_path = temp_file.name
 
-        # Only read file for preview data generation
-        a, sr = sf.read(temp_path, dtype='float32', always_2d=True)
-        a = to_stereo(a)
+        # Stream file directly to temp location without loading in memory
+        try:
+            file.save(temp_path)
+            print(f"[Upload] Saved to temp file: {temp_path}")
+        except Exception as e:
+            print(f"[Upload] Error saving file: {e}")
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            return abort(500, f'Upload failed: {str(e)}')
 
-        # Generate lightweight preview versions only
-        a_mono = to_mono_mid(a)
-        a_ds_mono = _half_downsample(a_mono)
-        sr_ds = sr // 2
+        # Generate lightweight preview versions with memory limits
+        try:
+            # For large files, limit preview to first 30 seconds to save memory
+            max_frames = None
+            if file_size > 10 * 1024 * 1024:  # For files > 10MB
+                # Estimate sample rate and limit to 30 seconds
+                max_frames = int(44100 * 30)  # Assume 44.1kHz, 30 seconds max
+                print(f"[Upload] Large file detected, limiting preview to 30 seconds")
+
+            a, sr = sf.read(temp_path, dtype='float32', always_2d=True, frames=max_frames)
+            a = to_stereo(a)
+
+            # Generate lightweight preview versions only
+            a_mono = to_mono_mid(a)
+            a_ds_mono = _half_downsample(a_mono)
+            sr_ds = sr // 2
+
+        except Exception as e:
+            print(f"[Upload] Error reading audio file: {e}")
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            return abort(400, f'Invalid audio file: {str(e)}')
 
         FILES[fid] = {
             'temp_path': temp_path,  # Store temp file path instead of full audio

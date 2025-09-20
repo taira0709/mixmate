@@ -23,7 +23,7 @@ import pyloudnorm as pyln
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
 # Configure for large file uploads and memory optimization
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB limit (reduced for stability)
+app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB limit for large files
 app.config['UPLOAD_TIMEOUT'] = 600  # 10 minutes timeout
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 300  # Cache timeout
 

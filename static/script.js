@@ -1624,7 +1624,19 @@ fd.append('force_stereo', shouldForceStereoPreview() ? '1' : '0');
       const res = await fetch('/process', { method:'POST', body: fd, cache:'no-store' });
       if(!res.ok){
         hideProgress();
-        status.textContent = `ダウンロードに失敗しました (${res.status})`;
+
+        // Check if response has JSON error details
+        const contentType = res.headers.get('content-type');
+        if (contentType && contentType.includes('application/json')) {
+          try {
+            const errorData = await res.json();
+            status.textContent = `エラー: ${errorData.error || errorData.message || res.status}`;
+          } catch {
+            status.textContent = `ダウンロードに失敗しました (${res.status})`;
+          }
+        } else {
+          status.textContent = `ダウンロードに失敗しました (${res.status})`;
+        }
         return;
       }
 
@@ -1815,9 +1827,20 @@ try{
       signal: prevCtl.signal 
     });
     
-    if(!res.ok){ 
-      status.textContent = `プレビュー失敗 (${res.status})`; 
-      return; 
+    if(!res.ok){
+      // Check if response has JSON error details
+      const contentType = res.headers.get('content-type');
+      if (contentType && contentType.includes('application/json')) {
+        try {
+          const errorData = await res.json();
+          status.textContent = `プレビューエラー: ${errorData.error || errorData.message || res.status}`;
+        } catch {
+          status.textContent = `プレビュー失敗 (${res.status})`;
+        }
+      } else {
+        status.textContent = `プレビュー失敗 (${res.status})`;
+      }
+      return;
     }
 
     if (showDetailedProgress) {

@@ -1897,7 +1897,7 @@ def upload():
         try:
             file_size_mb = file_size / (1024 * 1024)
 
-            if file_size_mb > 1.0:  # Skip preview generation for large files
+            if file_size_mb > 10.0:  # Skip preview generation for very large files
                 print(f"[Upload] Large file detected ({file_size_mb:.1f}MB), skipping preview generation to save memory")
 
                 # Check if format conversion is needed for large files
@@ -2093,7 +2093,7 @@ def process_audio():
             file_size = os.path.getsize(temp_path)
             file_size_mb = file_size / (1024 * 1024)
 
-            if file_size_mb > 1.0:  # For files >1MB, use emergency fallback
+            if file_size_mb > 50.0:  # For files >50MB, use emergency fallback
                 print(f"[Emergency Fallback] Very large file detected: {file_size_mb:.1f}MB, returning original file")
 
                 # Emergency: Just return the original file without processing to avoid SIGKILL
@@ -2427,7 +2427,7 @@ def process_audio():
 
     # For large files, use temporary file to avoid memory issues
     file_size_mb = len(final) * final.itemsize / (1024 * 1024)
-    use_temp_file = file_size_mb > 1.0  # Use temp file for >1MB processed audio
+    use_temp_file = file_size_mb > 20.0  # Use temp file for >20MB processed audio
 
     if use_temp_file:
         # Use temporary file for large audio

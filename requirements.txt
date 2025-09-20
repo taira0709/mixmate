@@ -1,6 +1,7 @@
-Flask>=3.0
-numpy>=1.26
-soundfile>=0.12
-pyloudnorm>=0.1.1
-librosa>=0.10
-pedalboard>=0.9.10
+Flask>=3.0,<4.0
+numpy
+soundfile
+pyloudnorm
+librosa
+pedalboard
+gunicorn>=21.0,<22.0

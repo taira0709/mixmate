@@ -1947,9 +1947,9 @@ def upload():
             else:
                 # Normal preview generation for smaller files
                 max_frames = None
-                if file_size_mb > 0.5:  # For files > 0.5MB, limit preview to 15 seconds
-                    max_frames = int(44100 * 15)  # 15 seconds max
-                    print(f"[Upload] Medium file detected, limiting preview to 15 seconds")
+                if file_size_mb > 5.0:  # For files > 5MB, limit preview to 60 seconds
+                    max_frames = int(44100 * 60)  # 60 seconds max
+                    print(f"[Upload] Medium file detected, limiting preview to 60 seconds")
 
                 # Use safe_load_audio for automatic format conversion
                 a, sr = safe_load_audio(temp_path)

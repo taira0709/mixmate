@@ -1,6 +1,10 @@
 from __future__ import annotations
-import io, os, json, hashlib, tempfile, time
+import io, os, json, hashlib, tempfile, time, sys, gc
 from typing import Optional, Tuple, Union
+
+# Memory optimization settings
+sys.set_int_max_str_digits(0)  # Remove string conversion limits
+gc.set_threshold(100, 10, 10)  # More aggressive garbage collection
 
 import numpy as np
 import soundfile as sf
@@ -1814,23 +1818,41 @@ def upload():
 
         # Generate lightweight preview versions with memory limits
         try:
-            # For large files, limit preview to first 30 seconds to save memory
-            max_frames = None
-            if file_size > 10 * 1024 * 1024:  # For files > 10MB
-                # Estimate sample rate and limit to 30 seconds
-                max_frames = int(44100 * 30)  # Assume 44.1kHz, 30 seconds max
-                print(f"[Upload] Large file detected, limiting preview to 30 seconds")
+            file_size_mb = file_size / (1024 * 1024)
 
-            if max_frames is not None:
-                a, sr = sf.read(temp_path, dtype='float32', always_2d=True, frames=max_frames)
+            if file_size_mb > 1.5:  # Skip preview generation for very large files
+                print(f"[Upload] Large file detected ({file_size_mb:.1f}MB), skipping preview generation to save memory")
+
+                # Get basic audio info without loading the full file
+                with sf.SoundFile(temp_path) as f:
+                    sr = f.samplerate
+                    total_frames = len(f)
+                    duration = total_frames / sr
+
+                # Use empty preview data for large files
+                a_mono = np.array([[0.0], [0.0]], dtype=np.float32)  # Minimal stereo data
+                a_ds_mono = np.array([[0.0], [0.0]], dtype=np.float32)
+                sr_ds = sr // 2
+
+                print(f"[Upload] Skipped preview - Duration: {duration:.1f}s, SR: {sr}Hz")
+
             else:
-                a, sr = sf.read(temp_path, dtype='float32', always_2d=True)
-            a = to_stereo(a)
+                # Normal preview generation for smaller files
+                max_frames = None
+                if file_size_mb > 0.5:  # For files > 0.5MB, limit preview to 15 seconds
+                    max_frames = int(44100 * 15)  # 15 seconds max
+                    print(f"[Upload] Medium file detected, limiting preview to 15 seconds")
 
-            # Generate lightweight preview versions only
-            a_mono = to_mono_mid(a)
-            a_ds_mono = _half_downsample(a_mono)
-            sr_ds = sr // 2
+                if max_frames is not None:
+                    a, sr = sf.read(temp_path, dtype='float32', always_2d=True, frames=max_frames)
+                else:
+                    a, sr = sf.read(temp_path, dtype='float32', always_2d=True)
+                a = to_stereo(a)
+
+                # Generate lightweight preview versions only
+                a_mono = to_mono_mid(a)
+                a_ds_mono = _half_downsample(a_mono)
+                sr_ds = sr // 2
 
         except Exception as e:
             print(f"[Upload] Error reading audio file: {e}")
@@ -1962,6 +1984,9 @@ def process_audio():
                 # Add basic headers
                 resp.headers['X-EMERGENCY-FALLBACK'] = 'true'
                 resp.headers['X-FILE-SIZE-MB'] = f'{file_size_mb:.1f}'
+
+                # Force garbage collection for large files
+                gc.collect()
 
                 return resp
 

@@ -29,14 +29,30 @@ app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB limit for large fi
 # Audio array shape utility function
 def ensure_shape(x: np.ndarray) -> np.ndarray:
     """Ensure audio array is in (samples, channels) format for Pedalboard compatibility"""
+    original_shape = x.shape
+    print(f"[Audio Debug] Input shape: {original_shape}, dtype: {x.dtype}")
+
+    # Check for invalid data
+    if np.any(np.isnan(x)) or np.any(np.isinf(x)):
+        print(f"[Audio Debug] WARNING: Invalid data detected (NaN/Inf)")
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
     # Handle 1D arrays (mono)
     if x.ndim == 1:
         x = x[:, None]
     # If channels come first (like (2, N)) and N > channels, transpose
     elif x.shape[0] <= 8 and x.shape[1] > x.shape[0]:
+        print(f"[Audio Debug] Transposing from {x.shape} to avoid channel/sample confusion")
         x = x.T
+
     # Ensure float32 for consistency
-    return x.astype(np.float32, copy=False)
+    x = x.astype(np.float32, copy=False)
+
+    # Check peak levels for debugging
+    peak = np.max(np.abs(x)) if x.size > 0 else 0.0
+    print(f"[Audio Debug] Output shape: {x.shape}, peak: {peak:.6f}")
+
+    return x
 
 def safe_load_audio(file_path: str, sr: int = 44100):
     """Load audio file with automatic format conversion for unsupported formats"""

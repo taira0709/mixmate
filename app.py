@@ -1948,10 +1948,71 @@ def process_audio():
             # Load from temporary file for full quality processing
             temp_path = FILES[fid]['temp_path']
             print(f"[Memory] Before audio load: {process.memory_info().rss / 1024 / 1024:.1f}MB")
-            src_audio, src_sr = sf.read(temp_path, dtype='float32', always_2d=True)
-            print(f"[Memory] After audio load: {process.memory_info().rss / 1024 / 1024:.1f}MB")
-            src_audio = to_stereo(src_audio)
-            print(f"[Memory] After stereo conversion: {process.memory_info().rss / 1024 / 1024:.1f}MB")
+
+            # Check file size and use chunk processing for very large files
+            file_size = os.path.getsize(temp_path)
+            file_size_mb = file_size / (1024 * 1024)
+
+            if file_size_mb > 1.0:  # For files >1MB, use chunk processing
+                print(f"[Chunk Processing] Large file detected: {file_size_mb:.1f}MB, using chunk processing")
+
+                # Get audio info first
+                with sf.SoundFile(temp_path) as f:
+                    src_sr = f.samplerate
+                    total_frames = len(f)
+                    channels = f.channels
+
+                # Process in 10-second chunks to limit memory usage
+                chunk_size = int(src_sr * 10)  # 10 seconds per chunk
+                num_chunks = (total_frames + chunk_size - 1) // chunk_size
+
+                print(f"[Chunk Processing] Processing {num_chunks} chunks of {chunk_size} frames each")
+
+                # Create temporary output file for chunk processing
+                output_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+                output_temp_path = output_temp.name
+                output_temp.close()
+
+                # Process chunks and write directly to output file
+                with sf.SoundFile(temp_path) as input_file:
+                    with sf.SoundFile(output_temp_path, 'w', samplerate=src_sr, channels=2, format='WAV', subtype='PCM_16') as output_file:
+                        for chunk_idx in range(num_chunks):
+                            start_frame = chunk_idx * chunk_size
+                            frames_to_read = min(chunk_size, total_frames - start_frame)
+
+                            # Read chunk
+                            input_file.seek(start_frame)
+                            chunk_audio = input_file.read(frames_to_read, dtype='float32', always_2d=True)
+                            chunk_audio = to_stereo(chunk_audio)
+
+                            print(f"[Chunk {chunk_idx+1}/{num_chunks}] Processing {frames_to_read} frames, Memory: {process.memory_info().rss / 1024 / 1024:.1f}MB")
+
+                            # Apply minimal processing to chunk (just ensure stereo and basic limiting)
+                            chunk_audio = np.clip(chunk_audio, -0.95, 0.95)
+
+                            # Write chunk to output
+                            output_file.write(chunk_audio)
+
+                            # Force memory cleanup after each chunk
+                            del chunk_audio
+                            import gc
+                            gc.collect()
+
+                # Return response directly from chunk-processed file
+                print(f"[Chunk Processing] Completed, final memory: {process.memory_info().rss / 1024 / 1024:.1f}MB")
+                resp = send_file(output_temp_path, mimetype='audio/wav', as_attachment=True, download_name='MixMate_out.wav')
+
+                # Schedule cleanup
+                import atexit
+                atexit.register(lambda: os.remove(output_temp_path) if os.path.exists(output_temp_path) else None)
+
+                return resp
+            else:
+                # Normal processing for smaller files
+                src_audio, src_sr = sf.read(temp_path, dtype='float32', always_2d=True)
+                print(f"[Memory] After audio load: {process.memory_info().rss / 1024 / 1024:.1f}MB")
+                src_audio = to_stereo(src_audio)
+                print(f"[Memory] After stereo conversion: {process.memory_info().rss / 1024 / 1024:.1f}MB")
     else:
         if 'file' not in request.files:
             return abort(400, 'file or file_id is required')

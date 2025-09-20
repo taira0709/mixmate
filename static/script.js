@@ -728,9 +728,9 @@ async function processSelectedFile(f) {
     // タイムアウト制御用（グローバルスコープで管理）
     uploadController = new AbortController();
     const uploadTimeout = setTimeout(() => {
-      console.error('❌ Upload timeout (30s)');
+      console.error('❌ Upload timeout (120s)');
       uploadController.abort();
-    }, 30000); // 30秒タイムアウト
+    }, 120000); // 120秒タイムアウト（大きなファイル対応）
 
     try{
       updateProgress(35, '音声解析を開始中...', null, 2);

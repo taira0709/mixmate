@@ -1830,7 +1830,20 @@ def upload():
         # Stream file directly to temp location without loading in memory
         try:
             file.save(temp_path)
-            print(f"[Upload] Saved to temp file: {temp_path}")
+
+            # Validate saved file
+            saved_size = os.path.getsize(temp_path)
+            print(f"[Upload] Saved to temp file: {temp_path}, size: {saved_size} bytes")
+
+            if saved_size == 0:
+                print(f"[Upload] Error: Saved file is empty (0 bytes)")
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                return abort(400, 'Uploaded file is empty')
+
+            if saved_size != file_size:
+                print(f"[Upload] Warning: File size mismatch - Expected: {file_size}, Saved: {saved_size}")
+
         except Exception as e:
             print(f"[Upload] Error saving file: {e}")
             if os.path.exists(temp_path):
@@ -1871,6 +1884,13 @@ def upload():
                 else:
                     a, sr = sf.read(temp_path, dtype='float32', always_2d=True)
                 a = to_stereo(a)
+
+                # Validate loaded audio
+                peak_db = 20 * np.log10(np.max(np.abs(a)) + 1e-10)
+                print(f"[Upload] Loaded audio - Shape: {a.shape}, Peak: {peak_db:.1f} dBFS, SR: {sr}Hz")
+
+                if np.all(a == 0) or peak_db < -200:
+                    print(f"[Upload] Warning: Audio appears to be silent (peak: {peak_db:.1f} dBFS)")
 
                 # Generate lightweight preview versions only
                 a_mono = to_mono_mid(a)

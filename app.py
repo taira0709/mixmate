@@ -18,6 +18,18 @@ import pyloudnorm as pyln
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
+# Configure for large file uploads
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB limit
+app.config['UPLOAD_TIMEOUT'] = 300  # 5 minutes timeout
+
+# Error handler for large files
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return jsonify({
+        'error': 'File too large',
+        'message': f'Maximum file size is {app.config["MAX_CONTENT_LENGTH"] / 1024 / 1024:.0f}MB'
+    }), 413
+
 # ======================================================
 # Utils
 # ======================================================
@@ -1769,10 +1781,24 @@ def upload():
     if file.filename == '':
         return abort(400, 'empty file')
 
-    # Generate file ID from file content
-    raw = file.read()
-    file.seek(0)  # Reset file pointer
-    fid = _make_file_id(raw)
+    # Check file size before processing
+    file.seek(0, 2)  # Seek to end
+    file_size = file.tell()
+    file.seek(0)  # Reset to beginning
+
+    print(f"[Upload] File size: {file_size / 1024 / 1024:.2f} MB")
+
+    if file_size > app.config['MAX_CONTENT_LENGTH']:
+        return abort(413, f'File too large. Maximum size: {app.config["MAX_CONTENT_LENGTH"] / 1024 / 1024:.0f}MB')
+
+    # Generate file ID from file content (for smaller files) or filename + size for large files
+    if file_size < 10 * 1024 * 1024:  # For files < 10MB, use content hash
+        raw = file.read()
+        file.seek(0)  # Reset file pointer
+        fid = _make_file_id(raw)
+    else:  # For large files, use filename + size hash to avoid loading in memory
+        import hashlib
+        fid = hashlib.sha1(f"{file.filename}_{file_size}".encode()).hexdigest()[:16]
 
     if fid not in FILES:
         # Save to temporary file instead of keeping in memory

@@ -5,3 +5,4 @@ pyloudnorm
 librosa
 pedalboard
 gunicorn>=21.0,<22.0
+psutil

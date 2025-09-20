@@ -1887,10 +1887,18 @@ def process_audio():
 
     # ここに追加
     print(f"[Debug] === PROCESS START ===")
-    
+
+    # Add memory monitoring
+    import psutil
+    process = psutil.Process()
+    initial_memory = process.memory_info().rss / 1024 / 1024  # MB
+    print(f"[Memory] Initial: {initial_memory:.1f}MB")
+
     fid  = request.form.get('file_id')
     mode = request.form.get('mode', 'download')
     force_stereo = str(request.form.get('force_stereo', '0')).lower() in ('1','true','yes')
+
+    print(f"[Process] fid={fid}, mode={mode}, force_stereo={force_stereo}")
     
     # さらに追加
     gender  = request.form.get('gender', 'male')
@@ -1939,8 +1947,11 @@ def process_audio():
         else:
             # Load from temporary file for full quality processing
             temp_path = FILES[fid]['temp_path']
+            print(f"[Memory] Before audio load: {process.memory_info().rss / 1024 / 1024:.1f}MB")
             src_audio, src_sr = sf.read(temp_path, dtype='float32', always_2d=True)
+            print(f"[Memory] After audio load: {process.memory_info().rss / 1024 / 1024:.1f}MB")
             src_audio = to_stereo(src_audio)
+            print(f"[Memory] After stereo conversion: {process.memory_info().rss / 1024 / 1024:.1f}MB")
     else:
         if 'file' not in request.files:
             return abort(400, 'file or file_id is required')
@@ -2183,6 +2194,11 @@ def process_audio():
         final = np.clip(x_fx, -0.85, 0.85)
         tp_db = peak_db(final)
         print(f"[Hard Clipping] Peak limited to: {tp_db:.2f} dBFS")
+
+    # Memory checkpoint at 90% completion
+    memory_90 = process.memory_info().rss / 1024 / 1024
+    print(f"[Memory] At 90% completion: {memory_90:.1f}MB")
+
     # 参考値としてのLUFS測定（強制調整はしない）
     if mode == 'preview':
         lufs_out = float('nan')  # プレビューでは省略
@@ -2204,12 +2220,14 @@ def process_audio():
         output_temp.close()
 
         print(f"[Large Audio] Using temp file for {file_size_mb:.1f}MB processed audio")
+        print(f"[Memory] Before file write: {process.memory_info().rss / 1024 / 1024:.1f}MB")
 
         if mode == 'preview':
             sf.write(output_temp_path, final, src_sr, format='WAV', subtype='FLOAT')
         else:
             sf.write(output_temp_path, final, src_sr, format='WAV', subtype='PCM_16')
 
+        print(f"[Memory] After file write: {process.memory_info().rss / 1024 / 1024:.1f}MB")
         buf = None  # Will use file path instead
     else:
         # Use memory buffer for smaller files

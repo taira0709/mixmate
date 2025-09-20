@@ -1953,7 +1953,7 @@ def process_audio():
             file_size = os.path.getsize(temp_path)
             file_size_mb = file_size / (1024 * 1024)
 
-            if file_size_mb > 1.0:  # For files >1MB, use chunk processing
+            if file_size_mb > 0.5:  # For files >0.5MB, use chunk processing
                 print(f"[Chunk Processing] Large file detected: {file_size_mb:.1f}MB, using chunk processing")
 
                 # Get audio info first
@@ -1962,8 +1962,8 @@ def process_audio():
                     total_frames = len(f)
                     channels = f.channels
 
-                # Process in 10-second chunks to limit memory usage
-                chunk_size = int(src_sr * 10)  # 10 seconds per chunk
+                # Process in 5-second chunks to limit memory usage
+                chunk_size = int(src_sr * 5)  # 5 seconds per chunk
                 num_chunks = (total_frames + chunk_size - 1) // chunk_size
 
                 print(f"[Chunk Processing] Processing {num_chunks} chunks of {chunk_size} frames each")

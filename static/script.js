@@ -1,0 +1,2162 @@
+let gender = 'male', style = 'pop', noiseGate = 'weak';
+let delayDb = 0, reverbDb = 0; // 個別オフセット（-4/0/+4）
+let lastObjectUrl = null;
+let fileId = null;
+let prevCtl = null;     // /process 用のキャンセル制御
+let inspectCtl = null;  // /inspect 用のキャンセル制御   ← 追加
+let uploadController = null; // /upload 用のキャンセル制御 ← 追加
+let bpmCommitted = null; // ← Enterで確定された値。nullなら"未指定＝スタイル標準"
+// 既存の変数の後に追加
+let lastProcessedBpm = null;
+let bpmJustChanged = false;
+
+// ドラッグ&ドロップ処理用変数は削除（無限ループ対策）
+
+// クリック間隔制限用
+let lastPresetClickTime = 0;
+const MIN_PRESET_CLICK_INTERVAL = 100; // ミリ秒（100msに短縮）
+
+// ▼ LA-2A（Stage2）のユーザー指定（触った時だけ送る）
+let comp2TargetDb = null; // -3 / -7 / -10、未操作は null
+let comp2Touched  = false; // 一度でも触ったら true
+let reverbManuallySet = false; // ユーザーが手動でリバーブを設定したかのフラグ
+
+// ▼ Saturation のユーザー指定（触った時だけ送る）
+let satAmount  = null;   // 0.0〜1.0（例：0.2 / 0.4 / 0.7）。未操作は null
+let satTouched = false;  // 一度でも触ったら true
+
+
+// プロモード用：各エフェクトのON/OFF（初期は全部ON）- 新しいエフェクト追加
+let fxOn = {
+  noise_gate: true, eq: true, comp1: true, comp2: true,
+  deess: true, style_eq: true, saturation: true,  // 新機能追加
+  delay: true, reverb: true, limiter: true
+};
+
+// 改善: Debounce用のタイマー
+let presetUpdateTimer = null;
+let fxUpdateTimer = null;
+let isUpdating = false;
+
+// 連打対策：プレビュー実行を直近1回に集約
+let previewInFlight = false;
+let previewDirty = false;
+
+async function schedulePreview() {
+  if (previewInFlight) { 
+    previewDirty = true; 
+    return; 
+  }
+  previewInFlight = true;
+  try {
+    await runPreviewIfPossible();   // 既存
+  } catch (e) {
+    if (e?.name !== 'AbortError') console.error(e);
+  } finally {
+    previewInFlight = false;
+    if (previewDirty) {
+      previewDirty = false;
+      schedulePreview();            // 最新状態でもう一度だけ
+    }
+  }
+}
+
+// 進捗表示用のヘルパー関数
+async function setStatusWithDelay(message, delay = 100) {
+  const status = document.getElementById('status');
+  status.textContent = message;
+  await new Promise(resolve => setTimeout(resolve, delay));
+}
+
+// === プリセット変更用中央ローディング制御関数 ===
+function showPresetLoading() {
+  console.log('[Debug] showPresetLoading called');
+  const overlay = document.getElementById('preset_loading_overlay');
+  if (overlay) {
+    overlay.style.display = 'flex';
+    console.log('[Debug] Preset loading overlay shown');
+  } else {
+    console.log('[Debug] Preset loading overlay not found!');
+  }
+}
+
+function hidePresetLoading() {
+  console.log('[Debug] ========== hidePresetLoading called ==========');
+
+  const overlay = document.getElementById('preset_loading_overlay');
+  if (overlay) {
+    overlay.style.display = 'none';
+    console.log('[Debug] Preset loading overlay hidden');
+  } else {
+    console.log('[Debug] Preset loading overlay not found');
+  }
+
+  // プレビュー更新中スピナーも確実に停止
+  const presetSpinner = document.getElementById('preset_spinner');
+  if (presetSpinner) {
+    console.log('[Debug] preset_spinner found, current display:', presetSpinner.style.display);
+    presetSpinner.style.display = 'none';
+    console.log('[Debug] preset_spinner display set to none, new value:', presetSpinner.style.display);
+  } else {
+    console.log('[Debug] preset_spinner element not found!');
+  }
+
+  // プレビュー更新中テキストも隠す
+  const presetTextIndicator = document.getElementById('preset_text_indicator');
+  if (presetTextIndicator) {
+    console.log('[Debug] preset_text_indicator found, current display:', presetTextIndicator.style.display);
+    presetTextIndicator.style.display = 'none';
+    console.log('[Debug] preset_text_indicator display set to none, new value:', presetTextIndicator.style.display);
+  } else {
+    console.log('[Debug] preset_text_indicator element not found!');
+  }
+
+  console.log('[Debug] ================================================');
+}
+
+// === 旧シンプルスピナー制御関数（互換性のため残す） ===
+function showSpinner() {
+  showPresetLoading();
+}
+
+function hideSpinner() {
+  hidePresetLoading();
+}
+
+// テスト用関数（デバッグ用）
+function testSpinner() {
+  console.log('[Test] Testing preset loading visibility');
+  showPresetLoading();
+  setTimeout(() => {
+    console.log('[Test] Hiding preset loading after 3 seconds');
+    hidePresetLoading();
+  }, 3000);
+}
+
+// 統一グレーアウト制御関数（シンプル版）
+function setUnifiedGrayOut(enable = true, level = 'normal', showSpinnerOnDisable = true) {
+  console.log(`[Debug] setUnifiedGrayOut called: enable=${enable}, level=${level}, showSpinner=${showSpinnerOnDisable}`);
+
+  const sections = [
+    'preset_section',
+    'preview_section',
+    'space_split_section'
+  ];
+
+  sections.forEach(sectionId => {
+    const section = document.getElementById(sectionId);
+    console.log(`[Debug] Section ${sectionId}:`, section ? 'Found' : 'NOT FOUND');
+    if (!section) return;
+
+    if (enable) {
+      section.classList.add('disabled-section');
+      console.log(`[Debug] Added disabled-section to ${sectionId}`);
+
+      // プリセットセクションの場合はスピナーを表示（但し、showSpinnerOnDisableがtrueの場合のみ）
+      if (sectionId === 'preset_section' && showSpinnerOnDisable) {
+        console.log('[Debug] Showing spinner because showSpinnerOnDisable=true');
+        showSpinner();
+      } else if (sectionId === 'preset_section') {
+        console.log('[Debug] NOT showing spinner because showSpinnerOnDisable=false');
+      }
+    } else {
+      section.classList.remove('disabled-section', 'light-disabled');
+      console.log(`[Debug] Removed disabled-section from ${sectionId}`);
+
+      // プリセットセクションの場合はスピナーを隠す
+      if (sectionId === 'preset_section') {
+        hideSpinner();
+      }
+    }
+  });
+
+  const audioEl = document.getElementById('preview_audio');
+  const proToggle = document.getElementById('pro_glance');
+  const proLabel = proToggle?.parentElement;
+
+  // プロモードチェックボックスの制御
+  if (proToggle && proLabel) {
+    if (enable) {
+      proToggle.disabled = true;
+      proLabel.classList.add('disabled');
+    } else {
+      proToggle.disabled = false;
+      proLabel.classList.remove('disabled');
+    }
+  }
+
+  if (audioEl) {
+    if (enable) {
+      audioEl.classList.add('disabled-audio');
+      try { audioEl.pause(); } catch {}
+      audioEl.currentTime = 0;
+    } else {
+      audioEl.classList.remove('disabled-audio');
+    }
+  }
+}
+
+// BPM値を取得するヘルパー関数（修正版）
+function getBpmValue() {
+  const bpmInput = document.getElementById('bpm_input');
+  if (!bpmInput) return 120; // デフォルトBPM
+  
+  const value = parseFloat(bpmInput.value);
+  // BPM値の妥当性チェック（60-200の範囲）
+  if (isNaN(value) || value < 60 || value > 200) {
+    return 120; // 無効な値の場合はデフォルト
+  }
+  return value;
+}
+
+// 入力欄の"今打っている値"をパース（コミットはしない）
+function parseBpmRaw() {
+  const el = document.getElementById('bpm_input');
+  if (!el) return null;
+  const raw = (el.value || '').trim();
+  if (raw === '') return null;
+  const v = parseFloat(raw);
+  if (Number.isNaN(v) || v < 60 || v > 200) return null;
+  return v;
+}
+
+// コミット済みBPMを取得（nullなら未指定＝スタイル標準でサーバ計算）
+function getBpmCommitted() {
+  return bpmCommitted;
+}
+
+// Chorus 系 or （今後）ダブラーONならステレオでプレビュー
+function shouldForceStereoPreview() {
+  const st = (style || '').toLowerCase();
+  if (st.startsWith('chorus')) return true;        // 'chorus' / 'chorus_wide'
+  if (fxOn && fxOn.doubler === true) return true;  // 将来のUI露出用の布石（現状は未使用）
+  return false;
+}
+
+// Enterで"確定"→この時だけプレビュー/FX一覧を更新
+async function commitBpmFromInput() {
+  // ★ BPM確定もクリック間隔制限対象 ★
+  const now = Date.now();
+  if (now - lastPresetClickTime < MIN_PRESET_CLICK_INTERVAL) {
+    console.log(`[Protection] BPM変更間隔が短すぎます: ${now - lastPresetClickTime}ms`);
+    return;
+  }
+  lastPresetClickTime = now;
+
+  const v = parseBpmRaw();
+  const oldBpm = bpmCommitted;
+  bpmCommitted = v;
+  
+  // BPMが実際に変更された場合のみフラグを立てる
+  if (oldBpm !== bpmCommitted) {
+    bpmJustChanged = true;
+    console.log(`BPM changed: ${oldBpm} → ${bpmCommitted}`);
+    setUnifiedGrayOut(true); // スピナー表示開始
+
+    const startTime = Date.now();
+    try {
+      await runPreviewIfPossible();
+      const proChk = document.getElementById('pro_glance');
+      if (proChk?.checked) await fetchAndRenderFxList();
+
+      // 最小500ms表示してからスピナーを隠す
+      const elapsed = Date.now() - startTime;
+      if (elapsed < 500) {
+        await new Promise(resolve => setTimeout(resolve, 500 - elapsed));
+      }
+    } finally {
+      setUnifiedGrayOut(false); // 処理完了後にスピナー非表示
+    }
+  } else {
+    await runPreviewIfPossible();
+    const proChk = document.getElementById('pro_glance');
+    if (proChk?.checked) await fetchAndRenderFxList();
+  }
+}
+
+function bindSeg(id, initial) {
+  const box = document.getElementById(id);
+  const btns = box.querySelectorAll('button');
+  btns.forEach(b => {
+    if (b.dataset.val === initial) {
+      b.setAttribute('aria-selected', 'true');
+    }
+  });
+}
+
+// ▼ 追加：小ヘルパー（選択状態の付け替え）
+function setSegSelected(id, val){
+  const box = document.getElementById(id);
+  if (!box) return;
+  box.querySelectorAll('button[aria-selected="true"]').forEach(b=>b.removeAttribute('aria-selected'));
+  const btn = box.querySelector(`button[data-val="${String(val)}"]`);
+  if (btn) btn.setAttribute('aria-selected','true');
+}
+
+// ▼ 追加：スタイル既定のComp量（LA-2A）
+function compDefaultByStyle(s){
+  const k = (s||'pop').toLowerCase();
+  if (k === 'narration') return null; // narration のみ Stage2 OFF
+  return -7; // 全スタイルで「標準」からスタート
+}
+
+function satDefaultByStyle(s){
+  const k = (s||'pop').toLowerCase();
+  if (k === 'narration') return 0.0; // narration のみオフ
+  return 0.4; // 全スタイルで「標準」からスタート
+}
+
+// ここに新しい関数を追加
+function getReverbDefaultByStyle(style) {
+  const s = (style || 'pop').toLowerCase();
+  if (s === 'rock') return 0;      // -14dB (標準)
+  if (s === 'pop') return 0;       // -14dB (標準)  
+  if (s === 'ballad') return 4;    // -10dB (強め)
+  if (s === 'chorus') return 6;    // -8dB (とても強い)
+  if (s === 'chorus_wide') return 2; // -12dB (やや強め)
+  return -8; // narration: -22dB (とても弱い)
+}
+
+function updateGlanceHeaders(h){
+  const g1 = parseFloat(h.get('X-GR1-PEAK-DB')||'NaN');
+  const g2 = parseFloat(h.get('X-GR2-PEAK-DB')||'NaN');
+  const lufs = parseFloat(h.get('X-LUFS')||'NaN');
+  const tp   = parseFloat(h.get('X-TP-DB')||'NaN');
+
+  if(!Number.isNaN(g1)){
+    document.getElementById('gr1_db').textContent = `GR: ${g1.toFixed(1)} dB`;
+    document.getElementById('gr1_bar').style.width = `${Math.min(100, Math.max(0, (g1/12)*100))}%`;
+  }
+  if(!Number.isNaN(g2)){
+    document.getElementById('gr2_db').textContent = `GR: ${g2.toFixed(1)} dB`;
+    document.getElementById('gr2_bar').style.width = `${Math.min(100, Math.max(0, (g2/12)*100))}%`;
+  }
+  if(!Number.isNaN(lufs)) document.getElementById('lufs').textContent = `LUFS: ${lufs.toFixed(1)}`;
+  if(!Number.isNaN(tp))   document.getElementById('tp').textContent   = `TP: ${tp.toFixed(1)} dBTP`;
+}
+
+// 改善: プリセット変更の軽量化関数
+async function smartPreviewUpdate() {
+  if (isUpdating) return;
+
+  isUpdating = true;
+  const status = document.getElementById('status');
+  status.textContent = '設定変更を処理中...';
+
+  // グレーアウトとスピナーを即座に表示
+  setUnifiedGrayOut(true);
+
+  // debounceで連続クリックを制御
+  clearTimeout(presetUpdateTimer);
+  presetUpdateTimer = setTimeout(async () => {
+    const startTime = Date.now();
+    try {
+      await setStatusWithDelay('プリセット更新中...', 50);
+      const proChk = document.getElementById('pro_glance');
+      if (proChk.checked) {
+        await setStatusWithDelay('エフェクト一覧更新中...', 50);
+        await fetchAndRenderFxList();
+      }
+      await setStatusWithDelay('プレビュー準備中...', 50);
+
+      // プレビュー処理の完了を待つ（schedulePreviewを使用）
+      await schedulePreview();
+
+      // 最小500ms表示してからスピナーを隠す
+      const elapsed = Date.now() - startTime;
+      if (elapsed < 500) {
+        await new Promise(resolve => setTimeout(resolve, 500 - elapsed));
+      }
+
+    } finally {
+      isUpdating = false;
+      // プレビュー処理完了後にグレーアウトを解除
+      setUnifiedGrayOut(false);
+    }
+  }, 200); // 200ms のdebounce
+}
+
+// 緊急リセット機能（デバッグ用）
+window.emergencyReset = function() {
+  console.log('🚨 Emergency reset triggered');
+  hideProgress();
+  hidePresetLoading();
+  setUnifiedGrayOut(false);
+
+  // 全てのタイマーをクリア
+  if (typeof presetUpdateTimer !== 'undefined' && presetUpdateTimer) {
+    clearTimeout(presetUpdateTimer);
+  }
+  if (typeof fxUpdateTimer !== 'undefined' && fxUpdateTimer) {
+    clearTimeout(fxUpdateTimer);
+  }
+
+  // AbortControllerもクリア
+  if (typeof prevCtl !== 'undefined' && prevCtl) {
+    prevCtl.abort();
+    prevCtl = null;
+  }
+  if (typeof inspectCtl !== 'undefined' && inspectCtl) {
+    inspectCtl.abort();
+    inspectCtl = null;
+  }
+  if (typeof uploadController !== 'undefined' && uploadController) {
+    uploadController.abort();
+    uploadController = null;
+  }
+
+  // ボタンを再有効化
+  const previewBtn = document.getElementById('preview');
+  const downloadBtn = document.getElementById('download');
+  if (previewBtn) previewBtn.disabled = false;
+  if (downloadBtn) downloadBtn.disabled = false;
+
+  // ステータスをクリア
+  const status = document.getElementById('status');
+  if (status) status.textContent = 'リセット完了：ファイルを選択してください';
+
+  console.log('✅ Emergency reset completed');
+};
+
+window.addEventListener('DOMContentLoaded', ()=>{
+  // ページロード時に全てのローディング状態をリセット
+  hideProgress();
+  hidePresetLoading();
+  // 初期状態では全セクションをスピナーなしでグレーアウト
+  setUnifiedGrayOut(true, 'normal', false);
+
+  // プロモードチェックボックスを初期状態で無効化
+  const proToggle = document.getElementById('pro_glance');
+  const proLabel = proToggle?.parentElement;
+  if (proToggle && proLabel) {
+    proToggle.disabled = true;
+    proToggle.checked = false;
+    proLabel.classList.add('disabled');
+  }
+
+  bindSeg('gender_toggle', gender);
+  bindSeg('style_toggle',  style);
+  bindSeg('ng_toggle',     noiseGate);
+  bindSeg('delay_space_toggle',  '0');
+  bindSeg('reverb_space_toggle', '0');
+  // ▼ 追加：見た目だけスタイル既定にしておく（未操作＝送信しない）
+  bindSeg('comp2_amount_toggle', String(compDefaultByStyle(style) ?? -7));
+  bindSeg('sat_amount_toggle',   String(satDefaultByStyle(style))); // ← 追加
+
+  // エフェクト一括オンオフボタンのイベントリスナー（小さいボタン）
+  const bulkAllOnBtn = document.getElementById('bulk_all_on');
+  const bulkAllOffBtn = document.getElementById('bulk_all_off');
+
+  if (bulkAllOnBtn) {
+    bulkAllOnBtn.addEventListener('click', async () => {
+      bulkAllOnBtn.disabled = true;
+      bulkAllOffBtn.disabled = true;
+      try {
+        await toggleAllEffects(true);
+      } catch (error) {
+        console.error('全エフェクトONでエラー:', error);
+      } finally {
+        bulkAllOnBtn.disabled = false;
+        bulkAllOffBtn.disabled = false;
+      }
+    });
+  }
+
+  if (bulkAllOffBtn) {
+    bulkAllOffBtn.addEventListener('click', async () => {
+      bulkAllOnBtn.disabled = true;
+      bulkAllOffBtn.disabled = true;
+      try {
+        await toggleAllEffects(false);
+      } catch (error) {
+        console.error('全エフェクトOFFでエラー:', error);
+      } finally {
+        bulkAllOnBtn.disabled = false;
+        bulkAllOffBtn.disabled = false;
+      }
+    });
+  }
+});
+
+  const fileInput   = document.getElementById('file');
+  const previewBtn  = document.getElementById('preview');
+  const downloadBtn = document.getElementById('download');
+  const status      = document.getElementById('status');
+  const audioEl     = document.getElementById('preview_audio');
+
+  function updatePreviewBtnByState() {
+    // 新しいボタン構造に対応
+    const buttonIcon = previewBtn.querySelector('.button-icon');
+    const buttonText = previewBtn.querySelector('.button-text');
+
+    if (!audioEl.src) {
+      if (buttonIcon) buttonIcon.textContent = '▶';
+      if (buttonText) buttonText.textContent = 'プレビュー再生';
+      else previewBtn.textContent = '▶ プレビュー再生'; // フォールバック
+      previewBtn.disabled = false;
+      return;
+    }
+
+    if (audioEl.paused) {
+      if (buttonIcon) buttonIcon.textContent = '▶';
+      if (buttonText) buttonText.textContent = 'プレビュー再生';
+      else previewBtn.textContent = '▶ プレビュー再生'; // フォールバック
+    } else {
+      if (buttonIcon) buttonIcon.textContent = '⏸';
+      if (buttonText) buttonText.textContent = '一時停止';
+      else previewBtn.textContent = '⏸ 一時停止'; // フォールバック
+    }
+  }
+  window.updatePreviewBtnByState = updatePreviewBtnByState;
+
+  audioEl.addEventListener('play',  updatePreviewBtnByState);
+  audioEl.addEventListener('pause', updatePreviewBtnByState);
+  audioEl.addEventListener('ended', () => { audioEl.currentTime = 0; updatePreviewBtnByState(); updateCustomProgress(); });
+  updatePreviewBtnByState();
+  audioEl.autoplay = false;
+
+  // カスタムプログレスバー機能
+  const progressFill = document.getElementById('audio_progress_fill');
+  const progressHandle = document.getElementById('audio_progress_handle');
+  const progressTrack = document.getElementById('audio_progress_track');
+  const currentTimeEl = document.getElementById('current_time');
+  const totalTimeEl = document.getElementById('total_time');
+
+  function formatTime(seconds) {
+    if (isNaN(seconds) || seconds < 0) return '0:00';
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  }
+
+  function updateCustomProgress() {
+    if (!audioEl.duration || !progressFill || !progressHandle) return;
+
+    const progress = (audioEl.currentTime / audioEl.duration) * 100;
+    progressFill.style.width = `${progress}%`;
+    progressHandle.style.left = `${progress}%`;
+
+    if (currentTimeEl) currentTimeEl.textContent = formatTime(audioEl.currentTime);
+    if (totalTimeEl) totalTimeEl.textContent = formatTime(audioEl.duration);
+  }
+
+  // プログレスバーのクリック/ドラッグ機能
+  if (progressTrack) {
+    progressTrack.addEventListener('click', (e) => {
+      if (!audioEl.duration) return;
+      const rect = progressTrack.getBoundingClientRect();
+      const progress = (e.clientX - rect.left) / rect.width;
+      audioEl.currentTime = progress * audioEl.duration;
+      updateCustomProgress();
+    });
+  }
+
+  // 音声の時間更新
+  audioEl.addEventListener('timeupdate', updateCustomProgress);
+  audioEl.addEventListener('loadedmetadata', updateCustomProgress);
+  audioEl.addEventListener('durationchange', updateCustomProgress);
+
+// === ファイルアップロード処理（統合版） ===
+fileInput.addEventListener('change', async ()=>{
+    console.log('[Debug] File input change event triggered');
+
+    // === 最初に既存処理をクリーンアップ ===
+    // 既存のアップロード処理をキャンセル
+    if (typeof uploadController !== 'undefined' && uploadController) {
+      console.log('[Debug] Aborting existing upload');
+      uploadController.abort();
+    }
+
+    // 既存のプレビュー処理をキャンセル
+    if (prevCtl) {
+      console.log('[Debug] Aborting existing preview');
+      prevCtl.abort();
+      prevCtl = null;
+    }
+
+    // UI状態を確実にリセット
+    hideProgress();
+    hidePresetLoading();
+    setUnifiedGrayOut(false);
+
+    // ファイル情報表示
+    const f = fileInput.files?.[0];
+    console.log('[Debug] Selected file:', f ? f.name : 'No file');
+
+    // ファイル情報表示（通常選択）
+    if (f && !updateFileInfo(f, false)) {
+      // ユーザーがサイズ警告をキャンセルした場合、処理を中断
+      console.log('[Debug] User cancelled due to file size warning in file input');
+      return;
+    }
+
+    try { audioEl.pause(); } catch {}
+    audioEl.currentTime = 0;
+    updatePreviewBtnByState();
+
+    // 新しいファイル選択時は初回扱いにリセット
+    lastProcessedBpm = null;
+    bpmJustChanged = false;
+    reverbManuallySet = false; // リバーブ手動設定フラグもリセット
+
+    fileId = null;
+    if(!f){
+      console.log('[Debug] ================== FILE CANCEL DETECTED ==================');
+      console.log('[Debug] No file selected (user cancelled)');
+
+      console.log('[Debug] File selection cancelled by user');
+
+      // スピナー状態をデバッグ
+      const presetSpinner = document.getElementById('preset_spinner');
+      const presetTextIndicator = document.getElementById('preset_text_indicator');
+      console.log('[Debug] Before cleanup - preset_spinner display:', presetSpinner?.style.display);
+      console.log('[Debug] Before cleanup - preset_text_indicator display:', presetTextIndicator?.style.display);
+
+      status.textContent='ファイルが選択されていません';
+      disableAllSections(); // ファイルが選択されていない場合は再度無効化
+
+      // スピナー状態を再確認
+      console.log('[Debug] After cleanup - preset_spinner display:', presetSpinner?.style.display);
+      console.log('[Debug] After cleanup - preset_text_indicator display:', presetTextIndicator?.style.display);
+      console.log('[Debug] =====================================================');
+      return;
+    }
+
+    // ファイル処理を実行
+    await processSelectedFile(f);
+  });
+
+// 共通ファイル処理関数
+async function processSelectedFile(f) {
+  console.log('[Debug] Starting file upload process...');
+
+  // デバッグ用：ファイル情報を詳細ログ出力
+  console.log('🔍 Selected file details:', {
+    name: f.name,
+    size: f.size,
+    type: f.type,
+    lastModified: f.lastModified,
+    lastModifiedDate: f.lastModifiedDate,
+    webkitRelativePath: f.webkitRelativePath,
+    userAgent: navigator.userAgent,
+    isMobile: /Mobi|Android/i.test(navigator.userAgent)
+  });
+
+  // ファイルサイズチェック（スマホ用制限）
+    const maxSize = 100 * 1024 * 1024; // 100MB制限
+    if (f.size > maxSize) {
+      hideProgress();
+      status.textContent = `ファイルサイズが大きすぎます（${Math.round(maxSize / 1024 / 1024)}MB以下にしてください）`;
+      disableAllSections();
+      return;
+    }
+
+    // ファイル形式チェック
+    const fileName = f.name.toLowerCase();
+    const hasWavExtension = fileName.endsWith('.wav');
+    const hasM4aExtension = fileName.endsWith('.m4a');
+    const hasMp3Extension = fileName.endsWith('.mp3');
+    const hasAacExtension = fileName.endsWith('.aac');
+    const hasSupportedExtension = hasWavExtension || hasM4aExtension || hasMp3Extension || hasAacExtension;
+    const hasAudioType = f.type && f.type.startsWith('audio');
+
+    if (!f.type && !hasSupportedExtension) {
+      console.warn('⚠️ File type not detected, checking by extension');
+      if (!hasSupportedExtension) {
+        hideProgress();
+        hidePresetLoading();
+        setUnifiedGrayOut(false);
+        status.textContent = '音声ファイル（WAV, MP3）を選択してください';
+        disableAllSections();
+        return;
+      }
+    }
+
+    // Dropbox特有のファイル名問題チェック
+    if (f.name.length > 50 && /^[A-F0-9]+/.test(f.name) && !hasSupportedExtension) {
+      console.warn('⚠️ Possible Dropbox temporary filename detected:', f.name);
+      if (!hasAudioType) {
+        hideProgress();
+        hidePresetLoading();
+        setUnifiedGrayOut(false);
+        status.textContent = 'Dropboxから正しくダウンロードされていない可能性があります。ファイルを直接ダウンロードしてお試しください';
+        disableAllSections();
+        return;
+      }
+    }
+
+    // Dropbox特有の問題チェック
+    if (f.size === 0) {
+      console.error('❌ File size is 0 - possible Dropbox streaming issue');
+      hideProgress();
+      status.textContent = 'ファイルが正しく読み込まれていません。Dropboxから直接ダウンロードしてお試しください';
+      disableAllSections();
+      return;
+    }
+
+    console.log('[Debug] Showing progress bar...');
+    // エンハンスプログレスバー開始
+    showProgress('🎵 音声ファイルを処理中...', 'ファイルを読み込んでいます...', 0);
+    setProgressProcessingType('processing');
+
+    await new Promise(resolve => setTimeout(resolve, 150)); // プログレスバー表示待ち
+
+    // 段階的プログレス更新（より詳細に）
+    updateProgress(10, 'ファイル形式を確認中...', null, 1);
+    await new Promise(resolve => setTimeout(resolve, 200));
+
+    updateProgress(20, 'サーバーへアップロード中...', null, 1);
+    await new Promise(resolve => setTimeout(resolve, 300));
+
+    const fd = new FormData();
+
+    // FormData追加前のデバッグ
+    console.log('📤 Preparing FormData...');
+    try {
+      fd.append('file', f);
+      console.log('✅ FormData created successfully');
+    } catch (e) {
+      console.error('❌ FormData creation failed:', e);
+      hideProgress();
+      hidePresetLoading(); // プリセットローディングスピナーも確実に隠す
+      setUnifiedGrayOut(false); // グレーアウトも解除
+      status.textContent = 'ファイルの準備に失敗しました';
+      disableAllSections();
+      return;
+    }
+
+    // タイムアウト制御用（グローバルスコープで管理）
+    uploadController = new AbortController();
+    const uploadTimeout = setTimeout(() => {
+      console.error('❌ Upload timeout (30s)');
+      uploadController.abort();
+    }, 30000); // 30秒タイムアウト
+
+    try{
+      updateProgress(35, '音声解析を開始中...', null, 2);
+      setProgressProcessingType('analyzing');
+      console.time("📤 /upload fetch");
+      console.log('📤 Starting upload request...');
+
+      const res = await fetch('/upload', {
+        method: 'POST',
+        body: fd,
+        cache: 'no-store',
+        signal: uploadController.signal
+      });
+
+      clearTimeout(uploadTimeout);
+      console.timeEnd("📤 /upload fetch");
+      console.log('📤 Upload response received:', {
+        ok: res.ok,
+        status: res.status,
+        statusText: res.statusText,
+        headers: Object.fromEntries(res.headers.entries())
+      });
+
+      if(!res.ok){
+        hideProgress();
+        hidePresetLoading(); // プリセットローディングスピナーも確実に隠す
+        setUnifiedGrayOut(false); // グレーアウトも解除
+        status.textContent = `アップロード失敗 (${res.status})`;
+        disableAllSections();
+        return;
+      }
+
+      updateProgress(55, '音声データを処理中...', null, 3);
+      await new Promise(resolve => setTimeout(resolve, 200));
+
+      const j = await res.json();
+      fileId = j.file_id;
+
+      updateProgress(75, 'プレビューファイルを生成中...', null, 4);
+      setProgressProcessingType('rendering');
+      await new Promise(resolve => setTimeout(resolve, 250));
+
+      updateProgress(90, '最終調整中...', null, 5);
+      await new Promise(resolve => setTimeout(resolve, 200));
+
+      await runPreviewIfPossible();
+    }catch(e){
+      clearTimeout(uploadTimeout);
+      console.error('❌ Upload error details:', {
+        name: e.name,
+        message: e.message,
+        stack: e.stack
+      });
+
+      // 確実にすべてのUI状態をクリーンアップ
+      hideProgress();
+      hidePresetLoading(); // プリセットローディングスピナーも確実に隠す
+      setUnifiedGrayOut(false); // グレーアウトも解除
+
+      // AbortControllerもクリーンアップ
+      if (uploadController) {
+        uploadController = null;
+      }
+
+      // エラータイプ別のメッセージ
+      if (e.name === 'AbortError') {
+        status.textContent = 'アップロードがタイムアウトしました（ネットワークを確認してください）';
+      } else if (e.message.includes('Failed to fetch')) {
+        status.textContent = 'ネットワークエラーが発生しました（接続を確認してください）';
+      } else if (e.message.includes('NetworkError')) {
+        status.textContent = 'ネットワークエラー：ファイルサイズまたは接続に問題があります';
+      } else {
+        status.textContent = `アップロードエラー: ${e.message}`;
+      }
+
+      disableAllSections(); // エラー時は無効化
+    }
+}
+
+// プレビュー完了時の自動再生フラグ
+let autoPlayOnUpdate = false;
+
+// プレビュー自動再生の切り替え関数
+function toggleAutoPlay() {
+  autoPlayOnUpdate = !autoPlayOnUpdate;
+  const status = document.getElementById('status');
+  if (status) {
+    status.textContent = `自動再生: ${autoPlayOnUpdate ? 'ON' : 'OFF'}`;
+  }
+  console.log('[Debug] Auto-play toggled:', autoPlayOnUpdate);
+}
+
+// デバッグ用: 現在の状態を表示
+function showCurrentState() {
+  console.log('[Debug] Current state:', {
+    gender, style, noiseGate,
+    delayDb, reverbDb,
+    fxOn,
+    autoPlayOnUpdate
+  });
+}
+
+// ★ テスト用: プリセット適用テスト関数 ★
+function testPresetApplication() {
+  console.log('=== プリセット適用テスト開始 ===');
+
+  console.log('1. 現在の設定:', {
+    gender: gender,
+    style: style,
+    noiseGate: noiseGate
+  });
+
+  console.log('2. UI選択状態:');
+  const genderSelected = document.querySelector('#gender_toggle button[aria-selected="true"]')?.dataset?.val;
+  const styleSelected = document.querySelector('#style_toggle button[aria-selected="true"]')?.dataset?.val;
+  const ngSelected = document.querySelector('#ng_toggle button[aria-selected="true"]')?.dataset?.val;
+
+  console.log('   UI Gender:', genderSelected);
+  console.log('   UI Style:', styleSelected);
+  console.log('   UI NoiseGate:', ngSelected);
+
+  console.log('3. 状態とUIの一致:', {
+    gender_match: gender === genderSelected,
+    style_match: style === styleSelected,
+    noiseGate_match: noiseGate === ngSelected
+  });
+
+  console.log('=== テスト完了 ===');
+}
+
+// ★ テスト用: 個別調整適用テスト関数 ★
+function testSpaceApplication() {
+  console.log('=== 個別調整適用テスト開始 ===');
+
+  console.log('1. 現在の設定:', {
+    delayDb: delayDb,
+    reverbDb: reverbDb,
+    comp2TargetDb: comp2TargetDb,
+    satAmount: satAmount
+  });
+
+  console.log('2. UI選択状態:');
+  const delaySelected = document.querySelector('#delay_space_toggle button[aria-selected="true"]')?.dataset?.val;
+  const reverbSelected = document.querySelector('#reverb_space_toggle button[aria-selected="true"]')?.dataset?.val;
+  const comp2Selected = document.querySelector('#comp2_amount_toggle button[aria-selected="true"]')?.dataset?.val;
+  const satSelected = document.querySelector('#sat_amount_toggle button[aria-selected="true"]')?.dataset?.val;
+
+  console.log('   UI Delay:', delaySelected);
+  console.log('   UI Reverb:', reverbSelected);
+  console.log('   UI Comp2:', comp2Selected);
+  console.log('   UI Saturation:', satSelected);
+
+  console.log('3. 状態とUIの一致:', {
+    delay_match: delayDb === parseFloat(delaySelected),
+    reverb_match: reverbDb === parseFloat(reverbSelected),
+    comp2_match: comp2TargetDb === parseFloat(comp2Selected),
+    sat_match: satAmount === parseFloat(satSelected)
+  });
+
+  console.log('4. 設定フラグ:', {
+    comp2Touched: comp2Touched,
+    satTouched: satTouched,
+    reverbManuallySet: reverbManuallySet
+  });
+
+  console.log('=== テスト完了 ===');
+}
+
+// ★ テスト用: 個別調整ボタンの完全テスト ★
+function testSpaceButtonComprehensive() {
+  console.log('========================================');
+  console.log('🧪 個別調整ボタン完全テスト開始');
+  console.log('========================================');
+
+  // 1. 現在の状態確認
+  console.log('📊 1. 現在の内部状態:');
+  console.log('   delayDb:', delayDb);
+  console.log('   reverbDb:', reverbDb);
+  console.log('   comp2TargetDb:', comp2TargetDb);
+  console.log('   satAmount:', satAmount);
+  console.log('   comp2Touched:', comp2Touched);
+  console.log('   satTouched:', satTouched);
+  console.log('   reverbManuallySet:', reverbManuallySet);
+
+  // 2. UI状態確認
+  console.log('\n🖱️ 2. UI選択状態:');
+  const delayUI = document.querySelector('#delay_space_toggle button[aria-selected="true"]')?.dataset?.val;
+  const reverbUI = document.querySelector('#reverb_space_toggle button[aria-selected="true"]')?.dataset?.val;
+  const comp2UI = document.querySelector('#comp2_amount_toggle button[aria-selected="true"]')?.dataset?.val;
+  const satUI = document.querySelector('#sat_amount_toggle button[aria-selected="true"]')?.dataset?.val;
+
+  console.log('   UI Delay:', delayUI);
+  console.log('   UI Reverb:', reverbUI);
+  console.log('   UI Comp2:', comp2UI);
+  console.log('   UI Saturation:', satUI);
+
+  // 3. 一致確認
+  console.log('\n✅ 3. 状態とUI一致確認:');
+  const delayMatch = delayDb === parseFloat(delayUI);
+  const reverbMatch = reverbDb === parseFloat(reverbUI);
+  const comp2Match = comp2TargetDb === parseFloat(comp2UI);
+  const satMatch = satAmount === parseFloat(satUI);
+
+  console.log('   Delay一致:', delayMatch, `(${delayDb} vs ${delayUI})`);
+  console.log('   Reverb一致:', reverbMatch, `(${reverbDb} vs ${reverbUI})`);
+  console.log('   Comp2一致:', comp2Match, `(${comp2TargetDb} vs ${comp2UI})`);
+  console.log('   Saturation一致:', satMatch, `(${satAmount} vs ${satUI})`);
+
+  // 4. FormData送信予測
+  console.log('\n📤 4. FormData送信予測:');
+  console.log('   delay_offset_db: 必ず送信 =', delayDb);
+  console.log('   reverb_offset_db: 必ず送信 =', reverbDb);
+  console.log('   comp2_offset_db:', comp2Touched ? `送信予定 = ${comp2TargetDb}` : '送信されない (未操作)');
+  console.log('   sat_amount:', satTouched ? `送信予定 = ${satAmount}` : '送信されない (未操作)');
+
+  // 5. ボタン存在確認
+  console.log('\n🔘 5. ボタン存在確認:');
+  const spaceButton = document.getElementById('space_apply');
+  console.log('   個別調整適用ボタン:', spaceButton ? '✅ 存在' : '❌ 見つからない');
+
+  // 6. 総合判定
+  console.log('\n🎯 6. 総合判定:');
+  const allMatched = delayMatch && reverbMatch && comp2Match && satMatch;
+  const buttonExists = !!spaceButton;
+  const readyForTest = allMatched && buttonExists;
+
+  console.log('   全設定一致:', allMatched ? '✅ OK' : '❌ NG');
+  console.log('   ボタン準備:', buttonExists ? '✅ OK' : '❌ NG');
+  console.log('   テスト準備:', readyForTest ? '🟢 完了' : '🔴 問題あり');
+
+  if (readyForTest) {
+    console.log('\n🚀 テスト推奨: 個別調整適用ボタンをクリックしてください');
+  } else {
+    console.log('\n⚠️ 注意: 設定またはボタンに問題があります');
+  }
+
+  console.log('========================================');
+  console.log('🧪 個別調整ボタン完全テスト完了');
+  console.log('========================================');
+}
+
+// === グレーアウト制御関数 ===
+function enableAllSections() {
+  setUnifiedGrayOut(false);
+}
+
+function disableAllSections() {
+  console.log('[Debug] disableAllSections called - file cancelled, no spinner needed');
+  setUnifiedGrayOut(true, 'normal', false); // 第3引数でスピナー無効化
+}
+
+// === エンハンスプログレスバー制御関数 ===
+let progressStartTime = null;
+let progressTimer = null;
+
+function showProgress(title = 'ファイルを処理中...', text = 'お待ちください...', progress = 0) {
+  const overlay = document.getElementById('progress_overlay');
+  const titleEl = document.getElementById('progress_title');
+  const textEl = document.getElementById('progress_text');
+  const barEl = document.getElementById('progress_bar');
+  const percentageEl = document.getElementById('progress_percentage');
+  const currentStageEl = document.getElementById('current_stage');
+
+  // 開始時間を記録
+  progressStartTime = Date.now();
+
+  if (overlay) overlay.style.display = 'flex';
+  if (titleEl) titleEl.textContent = title;
+  if (textEl) textEl.textContent = text;
+  if (barEl) barEl.style.width = `${progress}%`;
+  if (percentageEl) percentageEl.textContent = `${Math.round(progress)}%`;
+  if (currentStageEl) currentStageEl.textContent = '1/5';
+
+  // 段階ドットをリセット
+  resetStages();
+
+  // 時間更新を開始
+  startTimeUpdater();
+}
+
+function updateProgress(progress, text = null, title = null, stage = null) {
+  const titleEl = document.getElementById('progress_title');
+  const textEl = document.getElementById('progress_text');
+  const barEl = document.getElementById('progress_bar');
+  const percentageEl = document.getElementById('progress_percentage');
+  const currentStageEl = document.getElementById('current_stage');
+
+  if (barEl) barEl.style.width = `${progress}%`;
+  if (percentageEl) percentageEl.textContent = `${Math.round(progress)}%`;
+  if (text && textEl) textEl.textContent = text;
+  if (title && titleEl) titleEl.textContent = title;
+  if (stage && currentStageEl) currentStageEl.textContent = `${stage}/5`;
+
+  // 段階ドットを更新
+  updateStages(progress);
+}
+
+function hideProgress() {
+  const overlay = document.getElementById('progress_overlay');
+  if (overlay) overlay.style.display = 'none';
+
+  // 時間更新を停止
+  stopTimeUpdater();
+
+  // 段階をリセット
+  resetStages();
+}
+
+// 段階ドット制御
+function resetStages() {
+  const stageDots = document.querySelectorAll('.stage-dot');
+  stageDots.forEach(dot => {
+    dot.classList.remove('active', 'completed');
+  });
+}
+
+function updateStages(progress) {
+  const stageDots = document.querySelectorAll('.stage-dot');
+  const stageProgress = [0, 20, 40, 60, 80, 100];
+
+  stageDots.forEach((dot, index) => {
+    const stageValue = stageProgress[index];
+    dot.classList.remove('active', 'completed');
+
+    if (progress > stageValue) {
+      dot.classList.add('completed');
+    } else if (progress >= stageValue - 10) {
+      dot.classList.add('active');
+    }
+  });
+}
+
+// 時間更新機能
+function startTimeUpdater() {
+  stopTimeUpdater(); // 既存のタイマーをクリア
+
+  progressTimer = setInterval(() => {
+    if (progressStartTime) {
+      const elapsed = Date.now() - progressStartTime;
+      const minutes = Math.floor(elapsed / 60000);
+      const seconds = Math.floor((elapsed % 60000) / 1000);
+      const timeString = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+
+      const timeEl = document.getElementById('elapsed_time');
+      if (timeEl) timeEl.textContent = timeString;
+    }
+  }, 1000);
+}
+
+function stopTimeUpdater() {
+  if (progressTimer) {
+    clearInterval(progressTimer);
+    progressTimer = null;
+  }
+}
+
+// 処理タイプ別のスタイル適用
+function setProgressProcessingType(type) {
+  const container = document.querySelector('.progress-container');
+  if (container) {
+    container.className = 'progress-container';
+    if (type) {
+      container.classList.add(type);
+    }
+  }
+}
+
+// === ドラッグ＆ドロップとファイル情報表示の追加 ===
+const uploadContainer = document.querySelector('.file-upload-container');
+const fileInfo = document.querySelector('.file-info');
+const fileName = document.querySelector('.file-name');
+const fileSize = document.querySelector('.file-size');
+
+if (uploadContainer) {
+  // ドラッグ＆ドロップ対応
+  uploadContainer.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    uploadContainer.classList.add('drag-over');
+  });
+
+  uploadContainer.addEventListener('dragleave', (e) => {
+    if (!uploadContainer.contains(e.relatedTarget)) {
+      uploadContainer.classList.remove('drag-over');
+    }
+  });
+
+  uploadContainer.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    uploadContainer.classList.remove('drag-over');
+    const files = e.dataTransfer.files;
+    if (files.length > 0) {
+      console.log('[Debug] File dropped, processing directly without change event');
+
+      const file = files[0];
+
+      // === 最初に既存処理をクリーンアップ ===
+      // 既存のアップロード処理をキャンセル
+      if (typeof uploadController !== 'undefined' && uploadController) {
+        console.log('[Debug] Aborting existing upload');
+        uploadController.abort();
+      }
+
+      // 既存のプレビュー処理をキャンセル
+      if (prevCtl) {
+        console.log('[Debug] Aborting existing preview');
+        prevCtl.abort();
+        prevCtl = null;
+      }
+
+      // UI状態を確実にリセット
+      hideProgress();
+      hidePresetLoading();
+      setUnifiedGrayOut(false);
+
+      // ファイル情報表示（ドラッグ&ドロップ）
+      if (!updateFileInfo(file, true)) {
+        // ユーザーがサイズ警告をキャンセルした場合、処理を中断
+        console.log('[Debug] User cancelled due to file size warning');
+        return;
+      }
+
+      try { audioEl.pause(); } catch {}
+      audioEl.currentTime = 0;
+      updatePreviewBtnByState();
+
+      // 新しいファイル選択時は初回扱いにリセット
+      lastProcessedBpm = null;
+      bpmJustChanged = false;
+      reverbManuallySet = false;
+
+      fileId = null;
+
+      // changeイベントを発生させずに直接処理
+      await processSelectedFile(file);
+    }
+  });
+
+  // ラベルクリック対応確保（フォールバック）
+  const label = uploadContainer.querySelector('label[for="file"]');
+  if (label) {
+    label.addEventListener('click', (e) => {
+      console.log('[Debug] Label clicked, triggering file input');
+      // デフォルトのlabel->input動作を確保
+    });
+  }
+}
+
+// ファイル情報表示機能
+function updateFileInfo(file, isDragDrop = false) {
+  if (!fileInfo || !fileName || !fileSize) return true;
+
+  if (file) {
+    fileName.textContent = file.name;
+    const sizeInMB = (file.size / (1024 * 1024)).toFixed(1);
+    fileSize.textContent = `${sizeInMB} MB`;
+
+    // ファイルサイズ警告
+    if (file.size > 100 * 1024 * 1024) {
+      fileSize.textContent += ' ⚠️ 大容量';
+      fileSize.style.color = '#ff6b6b';
+      if (!showSizeWarning(sizeInMB, isDragDrop)) {
+        return false; // ユーザーがキャンセルした場合
+      }
+    } else if (file.size > 80 * 1024 * 1024) {
+      fileSize.textContent += ' ⚠️ 要注意';
+      fileSize.style.color = '#ffa726';
+    } else {
+      fileSize.style.color = '#4caf50';
+    }
+
+    fileInfo.style.display = 'flex';
+  } else {
+    fileInfo.style.display = 'none';
+  }
+
+  return true;
+}
+
+function showSizeWarning(sizeInMB, isDragDrop = false) {
+  const message = `⚠️ ファイルサイズが${sizeInMB}MBです\n\n大容量ファイルはアップロードに失敗する可能性があります。\n\n推奨対処法:\n• 楽曲を短く分割する\n• サンプリング周波数を下げる (96kHz→48kHz)\n• ビット深度を下げる (24bit→16bit)\n\n続行しますか？`;
+
+  const userConfirmed = confirm(message);
+
+  if (!userConfirmed) {
+    // ファイルをクリア
+    const fileInput = document.getElementById('file-input');
+    if (fileInput) fileInput.value = '';
+    updateFileInfo(null);
+  }
+
+  return userConfirmed;
+}
+
+function showFileHelp() {
+  const helpContent = `📁 ファイル設定ガイド
+
+🎯 推奨設定:
+• 44.1kHz/16bit ステレオ (約10MB/分)
+  → CD品質、最もバランス良い
+
+• 48kHz/24bit ステレオ (約18MB/分)
+  → プロ用途、十分高音質
+
+⚠️ 避けるべき設定:
+• 96kHz/24bit (約36MB/分) - 容量大
+• 192kHz/32bit (約72MB/分) - 容量巨大
+
+💡 ファイルサイズを抑えるコツ:
+• 楽曲を短く分割 (3-4分程度)
+• 不要な無音部分をカット
+• モノラルで十分な場合はモノラル録音
+
+📏 アップロード制限:
+• 推奨: 40MB以下
+• 最大: 100MB程度`;
+
+  alert(helpContent);
+}
+
+// === 重複した古いコードを削除完了 ===
+
+  // プロモード
+  const proChk   = document.getElementById('pro_glance');
+  const compCard = document.getElementById('comp_glance');
+  const fxCard   = document.getElementById('fx_list');
+
+  proChk.addEventListener('change', async ()=>{
+    const on = proChk.checked;
+    compCard.hidden = !on;
+    fxCard.hidden   = !on;
+
+    if (!on) return;
+
+    try {
+      await setStatusWithDelay('プロモード：エフェクト情報取得中...', 50);
+      await fetchAndRenderFxList();
+    } catch (e) {
+      console.error('Pro mode init failed:', e);
+      const statusEl = document.getElementById('status');
+      if (statusEl) statusEl.textContent = 'プロモード：エフェクト情報の取得に失敗しました';
+    } finally {
+      // 「取得中…」は必ず消す
+      const statusEl = document.getElementById('status');
+      if (statusEl && statusEl.textContent.includes('プロモード：エフェクト情報')) {
+        statusEl.textContent = '';
+      }
+    }
+  });
+
+// 左カラムプリセット設定（一括適用方式）
+['gender_toggle','style_toggle','ng_toggle'].forEach(id=>{
+  const box = document.getElementById(id);
+  box.addEventListener('click', (ev)=>{
+    const btn = ev.target.closest('button');
+    if (!btn) return;
+    if (btn.getAttribute('aria-selected') === 'true') return;
+
+    // UI更新のみ（即座に処理は実行しない）
+    box.querySelectorAll('button[aria-selected="true"]').forEach(b=>b.removeAttribute('aria-selected'));
+    btn.setAttribute('aria-selected','true');
+
+    const val = btn.dataset.val;
+
+    // 状態更新のみ（プレビューは実行しない）
+    if (id === 'gender_toggle') {
+      gender = val;
+    } else if (id === 'style_toggle') {
+      style = val;
+      // スタイル変更時は右カラムの全設定を強制的に標準にリセット
+      delayDb = 0;
+      reverbDb = 0;
+      comp2TargetDb = compDefaultByStyle(style) ?? -7;
+      satAmount = satDefaultByStyle(style);
+
+      // 全てのフラグを強制リセット
+      comp2Touched = false;
+      satTouched = false;
+      reverbManuallySet = false;
+
+      // UI表示をすべて標準に更新
+      setSegSelected('delay_space_toggle', '0');
+      setSegSelected('reverb_space_toggle', '0');
+      setSegSelected('comp2_amount_toggle', String(comp2TargetDb));
+      setSegSelected('sat_amount_toggle', String(satAmount));
+
+      console.log('[Debug] Style changed - ALL right column controls force reset to standard');
+    } else if (id === 'ng_toggle') {
+      noiseGate = val;
+    }
+
+    console.log(`[Debug] Preset setting changed: ${id} = ${val} (not applied yet)`);
+
+    // ★ 設定変更後の状態確認（テスト用）★
+    console.log('[Test] Updated preset state:', {
+      gender: gender,
+      style: style,
+      noiseGate: noiseGate
+    });
+  });
+});
+
+// 右カラム設定（一括適用方式に変更）
+['delay_space_toggle','reverb_space_toggle','comp2_amount_toggle','sat_amount_toggle'].forEach(id=>{
+  const box = document.getElementById(id);
+  box.addEventListener('click', (ev)=>{
+    const btn = ev.target.closest('button');
+    if (!btn) return;
+    if (btn.getAttribute('aria-selected') === 'true') return;
+
+    // UI更新のみ（即座に処理は実行しない）
+    box.querySelectorAll('button[aria-selected="true"]').forEach(b=>b.removeAttribute('aria-selected'));
+    btn.setAttribute('aria-selected','true');
+
+    const val = btn.dataset.val;
+
+    // 状態更新のみ（プレビューは実行しない）
+    if (id === 'delay_space_toggle') {
+      delayDb = parseFloat(val) || 0;
+    } else if (id === 'reverb_space_toggle') {
+      reverbDb = parseFloat(val) || 0;
+      reverbManuallySet = true;
+      console.log('[Debug] Manual reverb set to', reverbDb);
+    } else if (id === 'comp2_amount_toggle') {
+      comp2TargetDb = parseFloat(val);
+      comp2Touched = true;
+    } else if (id === 'sat_amount_toggle') {
+      satAmount = parseFloat(val);
+      satTouched = true;
+      console.log(`[Debug] Saturation amount set: ${satAmount}, touched: ${satTouched}`);
+    }
+
+    console.log(`[Debug] Space setting changed: ${id} = ${val} (not applied yet)`);
+
+    // ★ 設定変更後の状態確認（テスト用）★
+    console.log('[Test] Updated space settings:', {
+      delayDb: delayDb,
+      reverbDb: reverbDb,
+      comp2TargetDb: comp2TargetDb,
+      satAmount: satAmount
+    });
+  });
+});
+
+// BPM入力（Enter確定方式）
+const bpmInput = document.getElementById('bpm_input');
+if (bpmInput) {
+  // 入力中は見た目のバリデーションだけ（リアルタイムで処理は走らせない）
+  bpmInput.addEventListener('input', () => {
+    const v = parseBpmRaw(); // ← 新ヘルパー
+    if (bpmInput.value.trim() !== '' && v === null) {
+      bpmInput.style.borderColor = '#f87171';
+      status.textContent = 'BPMは60～200、空欄はスタイル標準です';
+    } else {
+      bpmInput.style.borderColor = '#374151';
+      if (status.textContent.includes('BPM')) status.textContent = '';
+    }
+  });
+
+// 「適用」ボタン（スマホ向け確定UI：Enterと同等）
+const bpmApply = document.getElementById('bpm_apply');
+if (bpmApply) {
+  bpmApply.addEventListener('click', async () => {
+    try { audioEl.pause(); } catch {}
+    audioEl.currentTime = 0;
+    await commitBpmFromInput(); // 既存の確定→プレビュー/FX更新
+  });
+}
+
+// 左カラム一括適用ボタン
+const presetApply = document.getElementById('preset_apply');
+if (presetApply) {
+  presetApply.addEventListener('click', async () => {
+    // ★ クリック間隔制限チェック ★
+    const now = Date.now();
+    if (now - lastPresetClickTime < MIN_PRESET_CLICK_INTERVAL) {
+      console.log(`[Protection] プリセット適用間隔が短すぎます: ${now - lastPresetClickTime}ms`);
+      return;
+    }
+    lastPresetClickTime = now;
+
+    console.log('[Debug] Applying left column preset settings...');
+
+    // ★ 現在の設定値を確認（テスト用）★
+    console.log('[Test] Current preset settings:', {
+      gender: gender,
+      style: style,
+      noiseGate: noiseGate,
+      delayDb: delayDb,
+      reverbDb: reverbDb,
+      comp2TargetDb: comp2TargetDb,
+      satAmount: satAmount
+    });
+
+    // 音声停止
+    try { audioEl.pause(); } catch {}
+    audioEl.currentTime = 0;
+
+    // スピナー表示
+    setUnifiedGrayOut(true);
+
+    const startTime = Date.now();
+    try {
+      await runPreviewIfPossible();
+      const proChk = document.getElementById('pro_glance');
+      if (proChk?.checked) await fetchAndRenderFxList();
+
+      // 最小500ms表示してからスピナーを隠す
+      const elapsed = Date.now() - startTime;
+      if (elapsed < 500) {
+        await new Promise(resolve => setTimeout(resolve, 500 - elapsed));
+      }
+    } finally {
+      setUnifiedGrayOut(false);
+    }
+  });
+}
+
+// 右カラム（個別調整）一括適用ボタン
+const spaceApply = document.getElementById('space_apply');
+if (spaceApply) {
+  spaceApply.addEventListener('click', async () => {
+    // ★ クリック間隔制限チェック ★
+    const now = Date.now();
+    if (now - lastPresetClickTime < MIN_PRESET_CLICK_INTERVAL) {
+      console.log(`[Protection] 個別調整適用間隔が短すぎます: ${now - lastPresetClickTime}ms`);
+      return;
+    }
+    lastPresetClickTime = now;
+
+    console.log('[Debug] Applying right column space settings...');
+
+    // ★ 現在の個別調整設定値を確認（テスト用）★
+    console.log('[Test] Current space settings:', {
+      delayDb: delayDb,
+      reverbDb: reverbDb,
+      comp2TargetDb: comp2TargetDb,
+      satAmount: satAmount,
+      comp2Touched: comp2Touched,
+      satTouched: satTouched,
+      reverbManuallySet: reverbManuallySet
+    });
+
+    // 音声停止
+    try { audioEl.pause(); } catch {}
+    audioEl.currentTime = 0;
+
+    // スピナー表示
+    setUnifiedGrayOut(true);
+
+    const startTime = Date.now();
+    try {
+      await runPreviewIfPossible();
+      const proChk = document.getElementById('pro_glance');
+      if (proChk?.checked) await fetchAndRenderFxList();
+
+      // 最小500ms表示してからスピナーを隠す
+      const elapsed = Date.now() - startTime;
+      if (elapsed < 500) {
+        await new Promise(resolve => setTimeout(resolve, 500 - elapsed));
+      }
+    } finally {
+      setUnifiedGrayOut(false);
+    }
+  });
+}
+
+  // Enterで"確定"→ここでだけ再計算
+  bpmInput.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      try { audioEl.pause(); } catch {}
+      audioEl.currentTime = 0;
+      await commitBpmFromInput();
+    }
+  });
+
+  // blur では確定しない（必要ならここで commitBpmFromInput() を呼ぶ運用に変更可）
+}
+
+  // プレビュー再生
+  previewBtn.addEventListener('click', async (e) => {
+    if (!audioEl.src) await runPreviewIfPossible();
+    if (!audioEl.src) return;
+
+    if (e.shiftKey) { try { audioEl.pause(); } catch {}; audioEl.currentTime = 0; try { await audioEl.play(); } catch {}; return; }
+    if (audioEl.paused) { try { await audioEl.play(); } catch {} }
+    else { try { audioEl.pause(); } catch {} }
+  });
+
+    // ダウンロード（file_id 優先）+ BPM値の送信
+    downloadBtn.addEventListener('click', async ()=>{
+    // エンハンスプログレスバー開始
+    showProgress('🎧 高品質ファイルを生成中...', 'ダウンロード準備をしています...', 0);
+    setProgressProcessingType('rendering');
+
+    // 統一グレーアウト適用
+    setUnifiedGrayOut(true);
+
+    previewBtn.disabled = true; downloadBtn.disabled = true;
+
+    await new Promise(resolve => setTimeout(resolve, 100)); // プログレスバー表示待ち
+
+    const fd = new FormData();
+    if (fileId) {
+      fd.append('file_id', fileId);
+      updateProgress(10, 'キャッシュファイルを確認中...', null, 1);
+    } else {
+      const f = fileInput.files?.[0];
+      if (f) {
+        fd.append('file', f);
+        updateProgress(10, 'ファイルを読み込み中...', null, 1);
+      } else {
+        hideProgress();
+        status.textContent='音声ファイルを選んでください';
+        previewBtn.disabled = false; downloadBtn.disabled = false;
+        setUnifiedGrayOut(false);
+        return;
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+    
+fd.append('gender', gender);
+fd.append('style',  style);
+fd.append('noise_gate', noiseGate);
+fd.append('fx_on', JSON.stringify(fxOn));
+fd.append('mode', 'download');
+
+// Enterで確定した時だけ送る
+const b = getBpmCommitted();
+if (b !== null) fd.append('bpm', String(b));
+
+// コンプ量調整（右カラム方式）
+if (comp2Touched && comp2TargetDb !== null) {
+  const def = compDefaultByStyle(style); // スタイルごとのデフォルトGR
+  if (def !== null) {
+    const offset = comp2TargetDb - def;
+    fd.append('comp2_offset_db', String(offset));
+    console.log(`[Debug] Sent comp2_offset_db = ${offset} (target=${comp2TargetDb}, default=${def})`);
+  }
+}
+
+// ▼ ここに追加：Saturation 量（触った時だけ）
+if (satTouched && typeof satAmount === 'number') {
+  fd.append('sat_amount', String(satAmount)); // 例：0.2 / 0.4 / 0.7
+  console.log(`[Debug] Sending sat_amount: ${satAmount}`);
+} else {
+  console.log(`[Debug] Saturation not sent: touched=${satTouched}, amount=${satAmount}`);
+}
+
+fd.append('delay_offset_db',  String(delayDb));
+fd.append('reverb_offset_db', String(reverbDb));
+
+console.log('[Debug] Reverb settings - style:', style, 'reverbDb:', reverbDb);
+
+// ダブラー設定を追加
+const currentStyle = (style || '').toLowerCase();
+const isChorusStyle = currentStyle === 'chorus' || currentStyle === 'chorus_wide';
+if (isChorusStyle) {
+  fd.append('enable_doubler', '1');
+  console.log('[Debug] Doubler enabled for style:', style);
+} else {
+  fd.append('enable_doubler', '0');
+  console.log('[Debug] Doubler disabled for style:', style);
+}
+
+// 既存の行はそのまま
+fd.append('force_stereo', shouldForceStereoPreview() ? '1' : '0');
+
+    try{
+      // 段階的プログレス更新
+      updateProgress(25, 'ドライチェーンを処理中...', null, 2);
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      updateProgress(40, 'エフェクトを適用中...', null, 3);
+      await new Promise(resolve => setTimeout(resolve, 200));
+
+      updateProgress(55, 'スタイルEQを調整中...', null, 3);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      updateProgress(65, 'サチュレーションを処理中...', null, 4);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      updateProgress(75, 'ディレイ同期を適用中...', null, 4);
+      setProgressProcessingType('processing');
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      updateProgress(85, '高品質レンダリング中...', null, 5);
+      await new Promise(resolve => setTimeout(resolve, 200));
+
+      const res = await fetch('/process', { method:'POST', body: fd, cache:'no-store' });
+      if(!res.ok){
+        hideProgress();
+        status.textContent = `ダウンロードに失敗しました (${res.status})`;
+        return;
+      }
+
+      updateProgress(92, 'ラウドネス調整中...', null, 5);
+      updateGlanceHeaders(res.headers);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      updateProgress(98, 'ファイル生成中...', '🎉 完了まであと少し！', 5);
+
+      // PyWebView環境の検出とダウンロード処理
+      const contentType = res.headers.get('content-type');
+      if (contentType && contentType.includes('application/json')) {
+        // PyWebView環境 - JSONレスポンス
+        const data = await res.json();
+        if (data.pywebview && data.audio_b64) {
+          console.log('[Debug] PyWebView環境でBase64ダウンロード開始');
+          try {
+            if (typeof window.pywebview !== 'undefined' && window.pywebview.api) {
+              const result = await window.pywebview.api.save_file_with_dialog(data.audio_b64, data.filename);
+              console.log('[Debug] APIダウンロード結果:', result);
+            } else {
+              console.log('[Debug] PyWebView API利用不可、Blobダウンロードに切り替え');
+              const audioData = Uint8Array.from(atob(data.audio_b64), c => c.charCodeAt(0));
+              const blob = new Blob([audioData], { type: 'audio/wav' });
+              const url = URL.createObjectURL(blob);
+              const a = Object.assign(document.createElement('a'), { href: url, download: data.filename });
+              document.body.appendChild(a); a.click(); a.remove();
+              URL.revokeObjectURL(url);
+            }
+          } catch (error) {
+            console.error('[Debug] PyWebViewダウンロードエラー:', error);
+          }
+        }
+      } else {
+        // 通常のブラウザ環境 - Blobレスポンス
+        const blob = await res.blob();
+        const url  = URL.createObjectURL(blob);
+        const a    = Object.assign(document.createElement('a'), { href:url, download:'MixMate_out.wav' });
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+      }
+
+      updateProgress(100, '✨ ダウンロード完了！', '🎧 高品質ファイルが生成されました', 5);
+      await new Promise(resolve => setTimeout(resolve, 1000)); // 完了アニメーション表示
+      hideProgress();
+      status.textContent = 'ダウンロード完了！';
+    }catch(e){
+      console.error(e);
+      hideProgress();
+      status.textContent = 'エラーが発生しました';
+    }finally{
+      previewBtn.disabled = false; downloadBtn.disabled = false;
+      setUnifiedGrayOut(false); // ← この1行を追加
+      const proChk = document.getElementById('pro_glance');
+      if (proChk.checked) { 
+        await setStatusWithDelay('エフェクト情報更新中...', 50);
+        await fetchAndRenderFxList(); 
+      }
+    }
+  });
+
+// ---- 直近だけ有効（AbortController） ＋ プレビューは半分レート（サーバ側で自動適用） + BPM値送信 ----
+async function runPreviewIfPossible(){
+  const status   = document.getElementById('status');
+  const audioEl  = document.getElementById('preview_audio');
+  const preview  = document.getElementById('preview');
+  const download = document.getElementById('download');
+  const fileInput = document.getElementById('file');
+
+  // file_id も file も無いなら何もしない
+  const f = fileInput.files?.[0];
+  if (!fileId && !f) return;
+
+  try { audioEl.pause(); } catch {}
+  audioEl.currentTime = 0;
+
+  // 進捗表示付きプレビュー処理
+  await setStatusWithDelay('プレビュー準備中...', 50);
+  preview.disabled = true; download.disabled = true;
+
+  if (prevCtl) prevCtl.abort();
+  prevCtl = new AbortController();
+
+  const fd = new FormData();
+  if (fileId) {
+    fd.append('file_id', fileId);
+    await setStatusWithDelay('キャッシュ確認中...', 50);
+  } else if (f) {
+    fd.append('file', f);
+    await setStatusWithDelay('ファイル読み込み中...', 50);
+  }
+  
+fd.append('gender', gender);
+fd.append('style',  style);
+fd.append('noise_gate', noiseGate);
+fd.append('fx_on', JSON.stringify(fxOn));
+fd.append('mode', 'preview');
+
+// ★ プレビューで送信される設定値を確認（テスト用）★
+console.log('[Test] Preview FormData values:', {
+  gender: gender,
+  style: style,
+  noise_gate: noiseGate,
+  delayDb: delayDb,
+  reverbDb: reverbDb,
+  comp2TargetDb: comp2TargetDb,
+  satAmount: satAmount,
+  comp2Touched: comp2Touched,
+  satTouched: satTouched,
+  reverbManuallySet: reverbManuallySet,
+  mode: 'preview'
+});
+
+// ★ 実際にFormDataに追加される値を確認（テスト用）★
+console.log('[Test] FormData entries to be sent:');
+if (typeof comp2TargetDb === 'number' && comp2Touched) {
+  console.log('  comp2_offset_db will be sent:', comp2TargetDb);
+} else {
+  console.log('  comp2_offset_db will NOT be sent (not touched or invalid)');
+}
+if (typeof satAmount === 'number' && satTouched) {
+  console.log('  sat_amount will be sent:', satAmount);
+} else {
+  console.log('  sat_amount will NOT be sent (not touched or invalid)');
+}
+console.log('  delay_offset_db will be sent:', delayDb);
+console.log('  reverb_offset_db will be sent:', reverbDb);
+
+// Enterで確定した時だけ送る
+const b = getBpmCommitted();
+if (b !== null) fd.append('bpm', String(b));
+
+// ユーザーがComp量を触った時だけ送る
+if (comp2Touched && typeof comp2TargetDb === 'number') {
+  // 相対オフセット値として送信（-3/0/+3）
+  fd.append('comp2_offset_db', String(comp2TargetDb)); // -3 / 0 / +3
+}
+
+// ▼ ここに追加：Saturation 量（触った時だけ）
+if (satTouched && typeof satAmount === 'number') {
+  fd.append('sat_amount', String(satAmount)); // 例：0.2 / 0.4 / 0.7
+  console.log(`[Debug] Sending sat_amount to preview: ${satAmount}`);
+} else {
+  console.log(`[Debug] Preview saturation not sent: touched=${satTouched}, amount=${satAmount}`);
+}
+
+// 既存のコード
+fd.append('delay_offset_db',  String(delayDb));
+fd.append('reverb_offset_db', String(reverbDb));
+
+console.log('[Debug] Reverb settings - style:', style, 'reverbDb:', reverbDb);
+
+// 以下を追加
+const currentStyle = (style || '').toLowerCase();
+const isChorusStyle = currentStyle === 'chorus' || currentStyle === 'chorus_wide';
+if (isChorusStyle) {
+  fd.append('enable_doubler', '1');
+  console.log('[Debug] Doubler enabled for style:', style);
+} else {
+  fd.append('enable_doubler', '0');
+  console.log('[Debug] Doubler disabled for style:', style);
+}
+  // Chorus 系や（将来の）ダブラー有効時のみステレオプレビュー
+  fd.append('force_stereo', shouldForceStereoPreview() ? '1' : '0');
+
+try{
+    // 進捗メッセージの最適化
+    const isInitialLoad = lastProcessedBpm === null;
+    const showDetailedProgress = isInitialLoad || bpmJustChanged;
+
+    if (showDetailedProgress) {
+      await setStatusWithDelay('ドライチェーン適用中...', 100);
+      await setStatusWithDelay('エフェクト処理中...', 120);
+      
+      // BPM変更時のみディレイ同期メッセージ
+      if (bpmJustChanged) {
+        await setStatusWithDelay('ディレイ同期中...', 100);
+      }
+    } else {
+      // 通常の更新時は簡潔なメッセージ
+      await setStatusWithDelay('処理中...', 80);
+    }
+    
+    const res = await fetch('/process', { 
+      method:'POST', 
+      body: fd, 
+      cache:'no-store', 
+      signal: prevCtl.signal 
+    });
+    
+    if(!res.ok){ 
+      status.textContent = `プレビュー失敗 (${res.status})`; 
+      return; 
+    }
+
+    if (showDetailedProgress) {
+      await setStatusWithDelay('プレビューファイル生成中...', 50);
+    }
+    
+    updateGlanceHeaders(res.headers);
+
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+
+    if (lastObjectUrl) { try { URL.revokeObjectURL(lastObjectUrl); } catch {} lastObjectUrl = null; }
+
+    if (showDetailedProgress) {
+      await setStatusWithDelay('音声データ準備中...', 50);
+    }
+    
+    audioEl.removeAttribute('src');
+    audioEl.src = url;
+    audioEl.load();
+    lastObjectUrl = url;
+
+    window.updatePreviewBtnByState?.();
+    
+    // 完了メッセージの最適化
+    const committed = getBpmCommitted();
+    if (bpmJustChanged && committed !== null) {
+      status.textContent = `BPM ${committed} 同期完了！再生ボタンで確認してください。`;
+    } else if (isInitialLoad) {
+      const bpmLabel = (committed !== null) ? `BPM ${committed}` : 'スタイル標準';
+      status.textContent = `プレビュー準備完了（${bpmLabel}）。再生ボタンで確認してください。`;
+    } else {
+      status.textContent = 'プレビュー更新完了';
+    }
+
+    // ★ エンハンスプレビュー完了時の処理 ★
+    if (isInitialLoad) {
+      updateProgress(100, '✨ 処理完了！', '🎉 準備完了', 5);
+      await new Promise(resolve => setTimeout(resolve, 800)); // 完了アニメーションを表示
+      hideProgress();
+      enableAllSections();
+    }
+    // プリセット変更時のグレーアウト解除はsmartPreviewUpdateで処理されるため、ここでは行わない
+
+    // フラグをリセット
+    lastProcessedBpm = committed;
+    bpmJustChanged = false;
+
+  } catch (e) {
+    if (e.name === 'AbortError') return; // 古い要求は黙って捨てる
+    console.error(e);
+    status.textContent = 'エラーが発生しました';
+    bpmJustChanged = false; // エラー時もリセット
+  } finally {
+    preview.disabled = false; 
+    download.disabled = false;
+    prevCtl = null;
+    // 二重呼びを解消：ここでは fetchAndRenderFxList() を呼ばない
+  }
+}
+
+// 改善: FXトグル時の即座更新機能付き
+async function toggleFxAndUpdate(key, btn) {
+  // 1) 状態だけ切り替え（送信は後でまとめる）
+  fxOn[key] = !fxOn[key];
+
+  // 2) ボタンの見た目は即時反映（DOMの再構築はしない）
+  if (btn) {
+    btn.textContent = fxOn[key] ? 'ON' : 'OFF';
+    btn.style.background = fxOn[key] ? '#1e3a8a' : '#222';
+    btn.style.color = fxOn[key] ? '#fff' : '#aaa';
+  }
+
+  // 3) 軽いステータス表示（任意）
+  const status = document.getElementById('status');
+  if (status) status.textContent = `${key} を${fxOn[key] ? 'ON' : 'OFF'} にしました`;
+
+  // 4) プレビューだけをデバウンス実行（/inspectは呼ばない）
+  clearTimeout(fxUpdateTimer);
+  fxUpdateTimer = setTimeout(() => {
+    // schedulePreview は内部で in-flight を畳み込む実装になっている想定
+    schedulePreview();  // await しない
+  }, 120);
+}
+
+// エフェクト一括オンオフ機能
+async function toggleAllEffects(turnOn) {
+  const status = document.getElementById('status');
+  if (status) status.textContent = `全エフェクトを${turnOn ? 'ON' : 'OFF'}にしています...`;
+
+  // 全エフェクトの状態を変更
+  Object.keys(fxOn).forEach(key => {
+    fxOn[key] = turnOn;
+  });
+
+  // UI上の個別エフェクトボタンも更新
+  const fxButtons = document.querySelectorAll('.fx-toggle');
+  fxButtons.forEach(btn => {
+    btn.textContent = turnOn ? 'ON' : 'OFF';
+    btn.style.background = turnOn ? '#1e3a8a' : '#222';
+    btn.style.color = turnOn ? '#fff' : '#aaa';
+  });
+
+  // プレビュー更新（デバウンス付き）
+  await schedulePreview();
+
+  if (status) status.textContent = `全エフェクトを${turnOn ? 'ON' : 'OFF'}にしました`;
+}
+
+// プロモード：エフェクト一覧（ON/OFFトグル付き）
+async function fetchAndRenderFxList(){
+  const wrap = document.getElementById('fx_items');
+  if (!wrap) { console.error('#fx_items が見つかりません'); return; }
+
+  // 既存の開閉状態とスクロール位置を保持
+  const openSet = new Set(Array.from(wrap.querySelectorAll('details[open]')).map(d => d.dataset.key));
+  const prevScroll = wrap.scrollTop;
+
+  const fd = new FormData();
+  fd.append('gender', gender);
+  fd.append('style',  style);
+  fd.append('noise_gate', noiseGate);
+  fd.append('fx_on', JSON.stringify(fxOn));
+
+  // Enterで確定した時だけ送る
+  const b = getBpmCommitted();
+  if (b !== null) fd.append('bpm', String(b));
+
+  // 触った時だけ送る（LA-2A 目標GR / Saturation量）
+  if (comp2Touched && typeof comp2TargetDb === 'number') {
+    fd.append('comp2_target_gr_db', String(comp2TargetDb));
+  }
+  if (satTouched && typeof satAmount === 'number') {
+    fd.append('sat_amount', String(satAmount)); // 例：0.2/0.4/0.7
+  }
+
+  // 個別オフセット
+  fd.append('delay_offset_db',  String(delayDb));
+  fd.append('reverb_offset_db', String(reverbDb));
+  // （ここは mode なしでOK）
+
+  // 直前の /inspect を中断して最新だけ有効化
+  if (inspectCtl) inspectCtl.abort();
+  inspectCtl = new AbortController();
+
+  // まずはテキストで受けてから JSON 化（失敗時の原因特定が容易）
+  let text;
+  try {
+    const res = await fetch('/inspect', { method:'POST', body:fd, cache:'no-store', signal:inspectCtl.signal });
+    text = await res.text();
+    if (!res.ok) throw new Error(`/inspect HTTP ${res.status}: ${text.slice(0,200)}`);
+  } catch (e) {
+    console.error('fetch /inspect error:', e);
+    wrap.innerHTML = `<div style="color:#f88">/inspect 取得に失敗しました。コンソールをご確認ください。</div>`;
+    return;
+  }
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    console.error('Invalid JSON from /inspect:', text);
+    wrap.innerHTML = `<div style="color:#f88">/inspect の応答がJSONではありません。</div>`;
+    return;
+  }
+
+  // サーバとフロントのキー名ズレに対応（effects / fx のどちらでもOK）
+  let effects = Array.isArray(data.effects) ? data.effects
+             : Array.isArray(data.fx)      ? data.fx
+             : [];
+  if (!Array.isArray(effects)) effects = [];
+
+  // 安全に描画：params が無い/ null のものはスキップ
+  wrap.innerHTML = '';
+  effects.forEach(eff => {
+    if (!eff || !eff.name) return;
+    if (!eff.params) return; // 無効 or 表示情報なしは非表示
+
+    const key = eff.key || eff.name;
+
+    const row = document.createElement('details');
+    row.dataset.key = key;
+    if (openSet.has(key)) row.setAttribute('open', '');
+    row.style.marginBottom = '8px';
+
+    // BPM同期の注記（Delayのみ）
+    let syncInfo = '';
+    if ((key === 'delay' || /delay/i.test(key)) && eff.params.delay_time_s !== undefined) {
+      const committed = getBpmCommitted();
+      const label = (committed === null) ? 'スタイル標準' : `${committed} BPM`;
+      syncInfo = `<div style="font-size:0.8em;color:#10b981;margin-top:4px;">🎵 BPM同期: ${label}</div>`;
+    }
+
+    // 見出しアイコン（絵文字を削除）
+    let effectIcon = '';
+    if (key === 'style_eq') effectIcon = '';
+    else if (key === 'saturation') effectIcon = '';
+
+    row.innerHTML = `
+      <summary style="cursor:pointer;display:flex;gap:8px;align-items:center;">
+        <span style="font-weight:600;">${effectIcon}${eff.name}</span>
+        <button type="button" class="fx-toggle" data-key="${key}"
+          style="margin-left:auto;padding:2px 10px;border-radius:999px;font-size:.85rem;border:1px solid #444;
+                 ${eff.enabled ? 'background:#1e3a8a;color:#fff' : 'background:#222;color:#aaa'}">
+          ${eff.enabled ? 'ON' : 'OFF'}
+        </button>
+      </summary>
+      ${syncInfo}
+      <pre style="white-space:pre-wrap;background:#0d0d0d;border:1px solid #222;border-radius:10px;padding:10px;margin-top:6px;overflow:auto;max-height:220px;">${
+        JSON.stringify(eff.params, null, 2)
+      }</pre>
+    `;
+    wrap.appendChild(row);
+  });
+
+  // トグルのワイヤリング
+  wrap.querySelectorAll('.fx-toggle').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const k = btn.dataset.key;
+      await toggleFxAndUpdate(k, btn);
+    });
+  });
+
+  wrap.scrollTop = prevScroll;
+}
+
+// ページ離脱時：最後の ObjectURL を解放
+window.addEventListener('beforeunload', () => {
+  if (lastObjectUrl) { try { URL.revokeObjectURL(lastObjectUrl); } catch {}; lastObjectUrl = null; }
+});
+
+// ===== 空間（Delay/Reverb）個別調整：UIだけ先行実装 =====
+(function(){
+  const appState = window.appState || (window.appState = {});
+  appState.spaceMode = appState.spaceMode || 'linked';   // 'linked' | 'split'
+  appState.spaceMasterDb = appState.spaceMasterDb ?? 0;  // -4 / 0 / +4
+  appState.delayOffsetDb = appState.delayOffsetDb ?? 0;  // -4 / 0 / +4
+  appState.reverbOffsetDb = appState.reverbOffsetDb ?? 0;
+
+  const spaceToggle   = document.getElementById('space_toggle');        // 既存（マスター）
+  const delayToggle   = document.getElementById('delay_space_toggle');  // 新規（個別）
+  const reverbToggle  = document.getElementById('reverb_space_toggle'); // 新規（個別）
+  const modeBadge     = document.getElementById('space_mode_badge');
+  const relinkBtn     = document.getElementById('space_relink_btn');
+  const fileInput     = document.getElementById('file');
+
+  if (!spaceToggle || !delayToggle || !reverbToggle) return;
+
+  function setSegSelected(segEl, val){
+    segEl.querySelectorAll('button[data-val]').forEach(btn=>{
+      const selected = btn.dataset.val === String(val);
+      if (selected) btn.setAttribute('aria-selected', 'true');
+      else btn.removeAttribute('aria-selected');
+    });
+  }
+  function segGetSelectedVal(segEl){
+    const el = segEl.querySelector('button[aria-selected="true"]') || segEl.querySelector('button[data-val="0"]');
+    return el ? el.dataset.val : "0";
+  }
+  function setDisabledForSeg(segEl, disabled){
+    segEl.querySelectorAll('button').forEach(b=> b.disabled = !!disabled);
+  }
+
+  function updateLinkedFromMaster(){
+    const v = segGetSelectedVal(spaceToggle);
+    appState.spaceMasterDb = Number(v);
+    if (appState.spaceMode === 'linked'){
+      setSegSelected(delayToggle, v);
+      setSegSelected(reverbToggle, v);
+    }
+  }
+
+  function enterSplit(){
+    if (appState.spaceMode === 'split') return;
+    appState.spaceMode = 'split';
+    if (modeBadge) modeBadge.textContent = '個別調整中';
+    if (relinkBtn) relinkBtn.hidden = false;
+    setDisabledForSeg(delayToggle, false);
+    setDisabledForSeg(reverbToggle, false);
+    // マスターは操作不可（グレーアウト扱い）
+    setDisabledForSeg(spaceToggle, true);
+  }
+
+  function relink(){
+    appState.spaceMode = 'linked';
+    if (modeBadge) modeBadge.textContent = 'リンク中';
+    if (relinkBtn) relinkBtn.hidden = true;
+    updateLinkedFromMaster();             // 個別をマスター値に合わせ直す
+    setDisabledForSeg(delayToggle, true); // 個別はロック
+    setDisabledForSeg(reverbToggle, true);
+    setDisabledForSeg(spaceToggle, false);
+  }
+
+  // 初期化（リンク中に戻す）
+  relink();
+
+  // マスターのクリック（linked時のみ反映）
+  spaceToggle.addEventListener('click', (e)=>{
+    const t = e.target.closest('button[data-val]');
+    if (!t) return;
+    if (appState.spaceMode === 'split') return; // 個別調整中は無効
+    // 既存の選択処理が走った後に反映
+    setTimeout(()=>{
+      updateLinkedFromMaster();
+      if (typeof runPreviewIfPossible === 'function') runPreviewIfPossible();
+    }, 0);
+  });
+
+  // 個別を触ったら split へ
+  [delayToggle, reverbToggle].forEach(seg=>{
+    seg.addEventListener('click', (e)=>{
+      const t = e.target.closest('button[data-val]');
+      if (!t) return;
+      enterSplit();
+      setTimeout(()=>{
+        appState.delayOffsetDb  = Number(segGetSelectedVal(delayToggle));
+        appState.reverbOffsetDb = Number(segGetSelectedVal(reverbToggle));
+        if (typeof runPreviewIfPossible === 'function') runPreviewIfPossible();
+      }, 0);
+    });
+  });
+
+  // 「リンクに戻す」
+  if (relinkBtn) relinkBtn.addEventListener('click', ()=>{
+    relink();
+    if (typeof runPreviewIfPossible === 'function') runPreviewIfPossible();
+  });
+
+  // ファイル選び直しで自動リセット
+  if (fileInput) fileInput.addEventListener('change', ()=>{ relink(); });
+
+  // （将来の結線用）他スクリプトから取得したい場合に備えて公開
+  window.getSpaceParams = function(){
+    return {
+      space_mode: appState.spaceMode,
+      space_master_db: appState.spaceMasterDb,
+      delay_offset_db: appState.delayOffsetDb,
+      reverb_offset_db: appState.reverbOffsetDb,
+    };
+  };
+})();

@@ -9,6 +9,7 @@ gc.set_threshold(100, 10, 10)  # More aggressive garbage collection
 import numpy as np
 import soundfile as sf
 from flask import Flask, render_template, request, send_file, abort, jsonify
+from pydub import AudioSegment
 
 # DSP
 from pedalboard import (
@@ -36,6 +37,44 @@ def ensure_shape(x: np.ndarray) -> np.ndarray:
         x = x.T
     # Ensure float32 for consistency
     return x.astype(np.float32, copy=False)
+
+def safe_load_audio(file_path: str, sr: int = 44100):
+    """Load audio file with automatic format conversion for unsupported formats"""
+    original_path = file_path
+    filename = file_path.lower()
+
+    # Check if conversion is needed
+    if filename.endswith(('.mp3', '.m4a', '.aac', '.flac', '.ogg')):
+        print(f"[Audio Convert] Converting {filename} to WAV for processing")
+        try:
+            # Load audio using pydub
+            if filename.endswith('.mp3'):
+                audio = AudioSegment.from_mp3(file_path)
+            elif filename.endswith('.m4a') or filename.endswith('.aac'):
+                audio = AudioSegment.from_file(file_path, format="m4a")
+            elif filename.endswith('.flac'):
+                audio = AudioSegment.from_file(file_path, format="flac")
+            elif filename.endswith('.ogg'):
+                audio = AudioSegment.from_ogg(file_path)
+
+            # Convert to WAV
+            wav_path = file_path + ".wav"
+            audio.export(wav_path, format="wav")
+            print(f"[Audio Convert] Converted to: {wav_path}")
+            file_path = wav_path
+
+        except Exception as e:
+            print(f"[Audio Convert] Conversion failed: {e}")
+            # Fall back to original file
+            file_path = original_path
+
+    # Load using soundfile
+    try:
+        data, actual_sr = sf.read(file_path, dtype='float32', always_2d=True)
+        return data, actual_sr
+    except Exception as e:
+        print(f"[Audio Load] Error loading {file_path}: {e}")
+        raise
 app.config['UPLOAD_TIMEOUT'] = 600  # 10 minutes timeout
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 300  # Cache timeout
 
@@ -1807,6 +1846,10 @@ def upload():
     if file.filename == '':
         return abort(400, 'empty file')
 
+    # Log file format for debugging
+    filename = file.filename.lower()
+    print(f"[Upload] Processing file: {filename}")
+
     # Check file size before processing
     file.seek(0, 2)  # Seek to end
     file_size = file.tell()
@@ -1879,11 +1922,14 @@ def upload():
                     max_frames = int(44100 * 15)  # 15 seconds max
                     print(f"[Upload] Medium file detected, limiting preview to 15 seconds")
 
-                if max_frames is not None:
-                    a, sr = sf.read(temp_path, dtype='float32', always_2d=True, frames=max_frames)
-                else:
-                    a, sr = sf.read(temp_path, dtype='float32', always_2d=True)
+                # Use safe_load_audio for automatic format conversion
+                a, sr = safe_load_audio(temp_path)
                 a = to_stereo(a)
+
+                # Apply frame limit after loading
+                if max_frames is not None and len(a) > max_frames:
+                    a = a[:max_frames]
+                    print(f"[Upload] Trimmed to {max_frames} frames for preview")
 
                 # Validate loaded audio
                 peak_db = 20 * np.log10(np.max(np.abs(a)) + 1e-10)
@@ -2088,8 +2134,8 @@ def process_audio():
 
                 return resp
             else:
-                # Normal processing for smaller files
-                src_audio, src_sr = sf.read(temp_path, dtype='float32', always_2d=True)
+                # Normal processing for smaller files with format conversion
+                src_audio, src_sr = safe_load_audio(temp_path)
                 print(f"[Memory] After audio load: {process.memory_info().rss / 1024 / 1024:.1f}MB")
                 src_audio = to_stereo(src_audio)
                 print(f"[Memory] After stereo conversion: {process.memory_info().rss / 1024 / 1024:.1f}MB")

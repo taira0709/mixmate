@@ -1,0 +1,28 @@
+{
+  "name": "MixMate",
+  "short_name": "MixMate",
+  "description": "Professional audio mixing and enhancement tool",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1a1a1a",
+  "theme_color": "#333333",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/static/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/static/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["audio", "productivity", "multimedia"],
+  "lang": "ja-JP",
+  "scope": "/",
+  "prefer_related_applications": false
+}

@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MixMate — ワンタップ自動ミキシング</title>
+  <link rel="icon" href="{{ url_for('static', filename='icon-192.png') }}">
+  <link rel="apple-touch-icon" href="{{ url_for('static', filename='icon-512.png') }}">
+  <meta name="theme-color" content="#333333" />
+
+  <!-- PWA Meta Tags -->
+  <link rel="manifest" href="{{ url_for('static', filename='manifest.json') }}">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="MixMate">
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v={{ range(1000000) | random }}">
+
+  <!-- テスト用統一グレーアウトCSS -->
+  <style>
+  .disabled-section,
+  .disabled-section.grid2,
+  .disabled-section.card {
+    opacity: 0.7 !important;
+    filter: grayscale(30%) !important;
+    pointer-events: none !important;
+    background-color: transparent !important;
+  }
+
+  .disabled-section *,
+  .disabled-section.grid2 *,
+  .disabled-section.card * {
+    opacity: inherit !important;
+    filter: inherit !important;
+  }
+
+  /* スピナーは無効化の対象外にする */
+  .disabled-section .simple-spinner {
+    opacity: 1 !important;
+    filter: none !important;
+    pointer-events: auto !important;
+  }
+
+  /* プロモードチェックタブのグレーアウト */
+  .pro-toggle.disabled {
+    opacity: 0.5 !important;
+    filter: grayscale(50%) !important;
+    pointer-events: none !important;
+  }
+
+  .pro-toggle.disabled input {
+    cursor: not-allowed !important;
+  }
+  </style></head>
+<body>
+
+<header class="header">
+    <div class="logo">🎧 MixMate</div>
+    <label class="pro-toggle disabled"><input id="pro_glance" type="checkbox" disabled> プロモード</label>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <h2>① ファイルを選択</h2>
+      <div class="file-upload-container">
+        <input id="file" type="file" class="file-upload-input"
+               accept="audio/wav,audio/mp3,audio/m4a,audio/aac,audio/flac,audio/ogg,.wav,.mp3,.m4a,.aac,.flac,.ogg" />
+        <label for="file" class="file-upload-label">
+          <div class="upload-icon">🎵</div>
+          <div class="upload-text">
+            <span class="upload-main">音声ファイルを選択</span>
+            <span class="upload-sub">またはドラッグ＆ドロップ</span>
+          </div>
+          <div class="upload-formats">WAV, MP3対応</div>
+        </label>
+        <div class="file-info" style="display: none;">
+          <span class="file-name"></span>
+          <span class="file-size"></span>
+        </div>
+        <div class="size-help">
+          <small>📁 <strong>推奨:</strong> 80MB以下 | <strong>最大:</strong> 100MB程度</small>
+        </div>
+      </div>
+    </section>
+
+    <section class="card grid2 disabled-section" id="preset_section">
+      <div>
+        <h2>② プリセット
+          <span id="preset_spinner" class="simple-spinner" style="display: none;"></span>
+          <span id="preset_text_indicator" style="display: none; color: #ff4444; margin-left: 8px; font-size: 0.9em;">処理中...</span>
+        </h2>
+        <div class="field">
+          <span>基本設定</span>
+          <div id="gender_toggle" class="seg">
+            <button type="button" data-val="male" aria-selected="true">男性</button>
+            <button type="button" data-val="female">女性</button>
+            <button type="button" data-val="smartphone" 
+                    title="スマホ収録音声用の周波数特性補正">SP</button>
+          </div>
+        </div>
+        <div class="field">
+          <span>スタイル</span>
+          <div id="style_toggle" class="seg">
+            <button type="button" data-val="rock">ROCK</button>
+            <button type="button" data-val="pop" aria-selected="true">POP</button>
+            <button type="button" data-val="ballad">Ballad</button>
+            <button type="button" data-val="narration">Narration</button>
+            <!-- Wide一本。data-valは chorus_wide のまま、ラベルだけ“Chorus”にしてOK -->
+            <button type="button" data-val="chorus_wide"
+                    title="ステレオ専用（モノで薄くなります）">Chorus</button>
+          </div>
+        </div>
+        <div class="field">
+          <span>ノイズゲート</span>
+          <div id="ng_toggle" class="seg">
+            <button type="button" data-val="weak" aria-selected="true">弱め</button>
+            <button type="button" data-val="strong">強め</button>
+          </div>
+        </div>
+
+        <!-- 基本設定適用ボタン -->
+        <div class="field" style="margin-top: 16px;">
+          <div style="display: flex; justify-content: center;">
+            <button id="preset_apply" class="btn btn-sm" type="button"
+                    style="background: #10b981; color: white; padding: 8px 24px; font-weight: 600;">
+              基本設定を適用
+            </button>
+          </div>
+          <small style="text-align: center; color: #888; margin-top: 4px; display: block;">
+            上記3つの設定をまとめて適用します
+          </small>
+        </div>
+
+<!-- BPM フィールド（ここはこの形で閉じる） -->
+<div class="field">
+  <span>BPM（ディレイ同期）</span>
+  <div class="bpm-row">
+    <input id="bpm_input" type="number" inputmode="numeric" min="60" max="200" step="1"
+           placeholder="未設定時は自動" />
+    <button id="bpm_apply" class="btn btn-sm" type="button" aria-label="BPMを適用">適用</button>
+  </div>
+  <small>空欄の場合は楽曲スタイルに応じた標準値を使用</small>
+
+</div>
+
+</div>
+
+</div>
+<div class="disabled-section" id="preview_section">
+  <h2>③ プレビュー & ダウンロード</h2>
+  <div class="preview-player-section">
+    <div class="preview-controls-wrapper">
+      <div class="preview-button-container">
+        <button id="preview" class="btn play-button-enhanced">
+          <span class="button-icon">▶</span>
+          <span class="button-text">プレビュー再生</span>
+        </button>
+        <button id="download" class="btn download-button-enhanced">
+          <span class="button-icon">⬇</span>
+          <span class="button-text">高品質でダウンロード</span>
+        </button>
+      </div>
+
+      <!-- カスタム音声コントロール -->
+      <div class="custom-audio-player">
+        <div class="audio-progress-container">
+          <div class="audio-progress-track" id="audio_progress_track">
+            <div class="audio-progress-fill" id="audio_progress_fill"></div>
+            <div class="audio-progress-handle" id="audio_progress_handle"></div>
+          </div>
+          <div class="audio-time-display">
+            <span class="current-time" id="current_time">0:00</span>
+            <span class="separator">/</span>
+            <span class="total-time" id="total_time">0:00</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="status" class="status"></div>
+  </div>
+
+  <!-- 元のaudio要素は隠すが残す（互換性のため） -->
+  <audio id="preview_audio" playsinline style="display: none;"></audio>
+
+  <!-- ▼ 空間の個別調整（見た目とUI挙動のみ。サーバ送信はまだ結線しない） -->
+<div id="space_split_section" class="disabled-section" style="margin-top:12px; padding:10px; border:1px solid #2a2a2a; border-radius:10px;">
+  <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+    <strong>個別調整</strong>
+  </div>
+
+  <div class="field" style="margin:6px 0;">
+    <div style="display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; align-items:start;">
+
+      <!-- Delay（左上） -->
+      <div>
+        <span>Delay 量</span>
+        <div id="delay_space_toggle" class="seg">
+          <button type="button" data-val="-4">控えめ</button>
+          <button type="button" data-val="0" aria-selected="true">標準</button>
+          <button type="button" data-val="+4">強め</button>
+        </div>
+      </div>
+
+      <!-- Comp（右上） -->
+      <div>
+        <span>Comp 量</span>
+        <div id="comp2_amount_toggle" class="seg">
+          <button type="button" data-val="-3">控えめ</button>
+          <button type="button" data-val="-7" aria-selected="true">標準</button>
+          <button type="button" data-val="-10">強め</button>
+        </div>
+      </div>
+
+      <!-- Reverb（左下） ← ここを左下に移動 -->
+      <div>
+        <span>Reverb 量</span>
+        <div id="reverb_space_toggle" class="seg">
+          <button type="button" data-val="-4">控えめ</button>
+          <button type="button" data-val="0" aria-selected="true">標準</button>
+          <button type="button" data-val="+4">強め</button>
+        </div>
+      </div>
+
+      <!-- Saturation（右下） ← ここを右下に移動 -->
+      <div>
+        <span>Saturation 量</span>
+        <div id="sat_amount_toggle" class="seg">
+          <button type="button" data-val="0.2">控えめ</button>
+          <button type="button" data-val="0.4" aria-selected="true">標準</button>
+          <button type="button" data-val="0.7">強め</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- 個別調整適用ボタン -->
+  <div class="field" style="margin-top: 16px;">
+    <div style="display: flex; justify-content: center;">
+      <button id="space_apply" class="btn btn-sm" type="button"
+              style="background: #3b82f6; color: white; padding: 8px 24px; font-weight: 600;">
+        個別調整を適用
+      </button>
+    </div>
+    <small style="text-align: center; color: #888; margin-top: 4px; display: block;">
+      上記4つの設定をまとめて適用します
+    </small>
+  </div>
+</div>
+
+    <div class="field" style="margin:6px 0;">
+
+  <!-- ▲ 空間の個別調整 -->
+</div>
+</section> <!-- ← 直前のセクションを閉じる -->
+
+<section id="comp_glance" class="card" hidden>
+  <h2>プロモード：処理の可視化（読み取り専用）</h2>
+  <div class="stage">
+    <div class="head">
+      <strong>Stage 1</strong><span class="sub">1176 / R-Vox（整音）</span>
+      <span id="gr1_db" class="pill">GR: -- dB</span>
+    </div>
+    <div class="meter"><div id="gr1_bar"></div></div>
+  </div>
+  <div class="stage">
+    <div class="head">
+      <strong>Stage 2</strong><span class="sub">LA-2A（仕上げ）</span>
+      <span id="gr2_db" class="pill">GR: -- dB</span>
+    </div>
+    <div class="meter"><div id="gr2_bar"></div></div>
+  </div>
+  <div class="summary">
+    <span id="lufs">LUFS: --</span>
+    <span id="tp">TP: -- dBTP</span>
+  </div>
+</section>
+
+<section id="fx_list" class="card" hidden>
+  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+    <h2 style="margin: 0;">プロモード</h2>
+
+    <!-- エフェクト一括オンオフボタン（右側に配置） -->
+    <div class="fx-bulk-controls-header">
+      <button id="bulk_all_on" class="bulk-fx-btn-small" type="button">
+        全ON
+      </button>
+      <button id="bulk_all_off" class="bulk-fx-btn-small" type="button">
+        全OFF
+      </button>
+    </div>
+  </div>
+
+  <div id="fx_items"></div>
+</section>
+  </main>
+
+<!-- プリセット変更用の中央ローディング表示 -->
+<div id="preset_loading_overlay" class="preset-loading-overlay" style="display: none;">
+  <div class="preset-loading-container">
+    <div class="preset-loading-spinner"></div>
+    <div class="preset-loading-text">プリセット変更中...</div>
+  </div>
+</div>
+
+<!-- エンハンスプログレスバーオーバーレイ -->
+  <div id="progress_overlay" class="progress-overlay">
+    <div class="progress-container">
+      <!-- アイコンとタイトル -->
+      <div class="progress-header">
+        <div class="progress-icon">
+          <div class="audio-wave-icon">
+            <span></span><span></span><span></span>
+          </div>
+        </div>
+        <div id="progress_title" class="progress-title">ファイルを処理中...</div>
+      </div>
+
+      <!-- 段階ドット表示（改良版） -->
+      <div class="progress-stages">
+        <div class="stage-connection"></div>
+        <div class="stage-dot" data-stage="0"><span>読込</span></div>
+        <div class="stage-dot" data-stage="1"><span>解析</span></div>
+        <div class="stage-dot" data-stage="2"><span>処理</span></div>
+        <div class="stage-dot" data-stage="3"><span>生成</span></div>
+        <div class="stage-dot" data-stage="4"><span>完了</span></div>
+      </div>
+
+      <!-- メインプログレスバー（改良版） -->
+      <div class="progress-bar-wrapper">
+        <div class="progress-bar-bg">
+          <div id="progress_bar" class="progress-bar">
+            <div class="progress-bar-shine"></div>
+          </div>
+          <div class="progress-percentage" id="progress_percentage">0%</div>
+        </div>
+      </div>
+
+      <!-- 波形アニメーション（改良版） -->
+      <div class="waveform-container">
+        <div class="waveform-label">🎵 音声処理中</div>
+        <div class="waveform-bars">
+          <div class="waveform-bar" style="animation-delay: 0ms;"></div>
+          <div class="waveform-bar" style="animation-delay: 100ms;"></div>
+          <div class="waveform-bar" style="animation-delay: 200ms;"></div>
+          <div class="waveform-bar" style="animation-delay: 300ms;"></div>
+          <div class="waveform-bar" style="animation-delay: 400ms;"></div>
+          <div class="waveform-bar" style="animation-delay: 500ms;"></div>
+          <div class="waveform-bar" style="animation-delay: 600ms;"></div>
+          <div class="waveform-bar" style="animation-delay: 700ms;"></div>
+          <div class="waveform-bar" style="animation-delay: 800ms;"></div>
+          <div class="waveform-bar" style="animation-delay: 900ms;"></div>
+        </div>
+      </div>
+
+      <!-- ステータス情報 -->
+      <div class="progress-status">
+        <div class="progress-time-info">
+          <div id="progress_text" class="progress-text">お待ちください...</div>
+          <div class="time-display">
+            <span class="time-label">経過時間:</span>
+            <span id="elapsed_time" class="time-value">0:00</span>
+          </div>
+        </div>
+        <div class="progress-stats">
+          <div class="stat-item">
+            <span class="stat-label">段階</span>
+            <span id="current_stage" class="stat-value">1/5</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">品質</span>
+            <span class="stat-value">高品質</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='script.js') }}?v={{ range(1000000) | random }}"></script>
+  <script>
+    // PWA Service Worker Registration
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('{{ url_for('static', filename='sw.js') }}')
+          .then((registration) => {
+            console.log('[PWA] Service Worker registered successfully:', registration.scope);
+
+            // Check for updates
+            registration.addEventListener('updatefound', () => {
+              const newWorker = registration.installing;
+              newWorker.addEventListener('statechange', () => {
+                if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                  // New version available
+                  if (confirm('新しいバージョンが利用可能です。今すぐ更新しますか？')) {
+                    window.location.reload();
+                  }
+                }
+              });
+            });
+          })
+          .catch((error) => {
+            console.log('[PWA] Service Worker registration failed:', error);
+          });
+      });
+
+      // Handle install prompt
+      let deferredPrompt;
+      window.addEventListener('beforeinstallprompt', (e) => {
+        e.preventDefault();
+        deferredPrompt = e;
+        // Show install button or banner
+        console.log('[PWA] Install prompt available');
+      });
+    }
+  </script>
+</body>
+</html>

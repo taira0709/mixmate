@@ -2108,7 +2108,7 @@ def process_audio():
 
                 return resp
 
-            elif file_size_mb > 0.5:  # For files 0.5-1.5MB, use chunk processing
+            elif False:  # Temporarily disable chunk processing to debug noise issues
                 print(f"[Chunk Processing] Large file detected: {file_size_mb:.1f}MB, using chunk processing")
 
                 # Get audio info first

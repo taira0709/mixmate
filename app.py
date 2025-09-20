@@ -1900,6 +1900,35 @@ def upload():
             if file_size_mb > 1.0:  # Skip preview generation for large files
                 print(f"[Upload] Large file detected ({file_size_mb:.1f}MB), skipping preview generation to save memory")
 
+                # Check if format conversion is needed for large files
+                filename = temp_path.lower()
+                if filename.endswith(('.mp3', '.m4a', '.aac', '.flac', '.ogg')):
+                    print(f"[Audio Convert] Large file format conversion needed: {filename}")
+                    try:
+                        from pydub import AudioSegment
+
+                        if filename.endswith('.mp3'):
+                            audio = AudioSegment.from_mp3(temp_path)
+                        elif filename.endswith('.m4a') or filename.endswith('.aac'):
+                            audio = AudioSegment.from_file(temp_path, format="mp4")
+                        elif filename.endswith('.flac'):
+                            audio = AudioSegment.from_file(temp_path, format="flac")
+                        elif filename.endswith('.ogg'):
+                            audio = AudioSegment.from_ogg(temp_path)
+
+                        wav_path = temp_path + ".wav"
+                        audio.export(wav_path, format="wav")
+
+                        # Update temp_path to point to converted file
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                        os.rename(wav_path, temp_path)
+
+                        print(f"[Audio Convert] Large file converted successfully")
+                    except Exception as e:
+                        print(f"[Audio Convert] Large file conversion failed: {e}")
+                        # Continue with original file, may fail later but better than crashing
+
                 # Get basic audio info without loading the full file
                 with sf.SoundFile(temp_path) as f:
                     sr = f.samplerate

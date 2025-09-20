@@ -1,6 +1,6 @@
 from __future__ import annotations
 import io, os, json, hashlib, tempfile, time
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import soundfile as sf
@@ -1272,9 +1272,9 @@ def _decay_to_room_size(decay: float) -> float:
 # 差し替え後（引数を1つだけ追加：bpm_specified=False）
 def build_space_effects_unified(
     dry_for_fx: np.ndarray, sr: int, style: str, use_bpm: float,
-    delay_enabled: bool, p: dict, fx_cache: dict | None, cache_key: str,
+    delay_enabled: bool, p: dict, fx_cache: Optional[dict], cache_key: str,
     bpm_specified: bool = False
-) -> tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray]:
 
     """空間系の高速・安定版: pre-delay は前段 Delay で再現し、
        Reverb/Delay は100% wetで“個別一発”。共通HPF/LPFは1回だけ。"""
@@ -1514,7 +1514,7 @@ def limiter_only(audio: np.ndarray, sr: int) -> Tuple[np.ndarray, float]:
 # ======================================================
 # プロモード用スナップショット（拡張版）
 # ======================================================
-def config_snapshot(gender: str, style: str, ng_mode: str, bpm: float | None, fx_on: dict | None = None):
+def config_snapshot(gender: str, style: str, ng_mode: str, bpm: Optional[float], fx_on: Optional[dict] = None):
     s = (style or 'pop').lower()
     g = (gender or 'male').lower()
     bpm_specified = bpm is not None
@@ -1810,13 +1810,22 @@ def upload():
 def index():
     return render_template('index.html')
 
-@app.post('/inspect')
+@app.route('/inspect', methods=['GET', 'POST'])
 def inspect_config():
-    gender = request.form.get('gender', 'male')
-    style  = request.form.get('style',  'pop')
-    ng     = request.form.get('noise_gate', 'weak')
-    bpm    = request.form.get('bpm', type=float, default=None)
-    fx_on_raw = request.form.get('fx_on', type=str, default=None)
+    # Handle both GET (URL params) and POST (form data)
+    if request.method == 'GET':
+        gender = request.args.get('gender', 'male')
+        style  = request.args.get('style',  'pop')
+        ng     = request.args.get('noise_gate', 'weak')
+        bpm    = request.args.get('bpm', type=float, default=None)
+        fx_on_raw = request.args.get('fx_on', type=str, default=None)
+    else:
+        gender = request.form.get('gender', 'male')
+        style  = request.form.get('style',  'pop')
+        ng     = request.form.get('noise_gate', 'weak')
+        bpm    = request.form.get('bpm', type=float, default=None)
+        fx_on_raw = request.form.get('fx_on', type=str, default=None)
+
     try:
         fx_map = json.loads(fx_on_raw) if fx_on_raw else None
     except Exception:

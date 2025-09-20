@@ -73,9 +73,10 @@ def safe_load_audio(file_path: str, sr: int = 44100):
             elif filename.endswith('.ogg'):
                 audio = AudioSegment.from_ogg(file_path)
 
-            # Convert to WAV
+            # Convert to WAV with specific settings to prevent noise
             wav_path = file_path + ".wav"
-            audio.export(wav_path, format="wav")
+            # Explicitly set sample width to 24-bit and ensure proper normalization
+            audio.export(wav_path, format="wav", parameters=["-acodec", "pcm_s24le", "-ar", "44100"])
             print(f"[Audio Convert] Converted to: {wav_path}")
             file_path = wav_path
 

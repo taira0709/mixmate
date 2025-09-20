@@ -24,6 +24,18 @@ app = Flask(__name__, static_folder="static", template_folder="templates")
 
 # Configure for large file uploads and memory optimization
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB limit for large files
+
+# Audio array shape utility function
+def ensure_shape(x: np.ndarray) -> np.ndarray:
+    """Ensure audio array is in (samples, channels) format for Pedalboard compatibility"""
+    # Handle 1D arrays (mono)
+    if x.ndim == 1:
+        x = x[:, None]
+    # If channels come first (like (2, N)) and N > channels, transpose
+    elif x.shape[0] <= 8 and x.shape[1] > x.shape[0]:
+        x = x.T
+    # Ensure float32 for consistency
+    return x.astype(np.float32, copy=False)
 app.config['UPLOAD_TIMEOUT'] = 600  # 10 minutes timeout
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 300  # Cache timeout
 
@@ -1303,7 +1315,10 @@ def build_space_effects_unified(
     # 共通前処理（1回だけ）
     common_hpf = float(p['r_hpf'])
     common_lpf = float(min(p['r_lpf'], p.get('d_lpf', p['r_lpf'])))
-    y = Pedalboard([HighpassFilter(common_hpf), LowpassFilter(common_lpf)])(x.T, sr).T
+    x_shaped = ensure_shape(x)
+    print(f"[Debug Shape] Before common filter: {x_shaped.shape}")
+    y = Pedalboard([HighpassFilter(common_hpf), LowpassFilter(common_lpf)])(x_shaped, sr)
+    print(f"[Debug Shape] After common filter: {y.shape}")
 
     # Reverb（100% wet）: pre-delayは前段Delayで再現
     room_size = _decay_to_room_size(float(p['decay']))
@@ -1316,7 +1331,10 @@ def build_space_effects_unified(
         print(f"[Debug Unified Reverb] Added pre-delay: {pre_ms}ms")
     rev_chain.append(Reverb(room_size=room_size, damping=0.25, wet_level=1.0, dry_level=0.0, width=0.9))
     print(f"[Debug Unified Reverb] Final chain length: {len(rev_chain)} nodes")
-    rev_wet = Pedalboard(rev_chain)(y.T, sr).T
+    y_shaped = ensure_shape(y)
+    print(f"[Debug Shape] Before reverb: {y_shaped.shape}")
+    rev_wet = Pedalboard(rev_chain)(y_shaped, sr)
+    print(f"[Debug Shape] After reverb: {rev_wet.shape}")
 
     # Delay（100% wet）
     if delay_enabled:
@@ -1447,7 +1465,10 @@ def get_space_wets_cached_fallback(
             LowpassFilter(float(p['d_lpf'])),
             Delay(delay_seconds=float(delay_seconds), feedback=float(p['fb']), mix=1.0),
         ]
-        delay_base = Pedalboard(delay_nodes)(x_for_fx.T, sr).T
+        x_fx_shaped = ensure_shape(x_for_fx)
+        print(f"[Debug Shape] Before delay: {x_fx_shaped.shape}")
+        delay_base = Pedalboard(delay_nodes)(x_fx_shaped, sr)
+        print(f"[Debug Shape] After delay: {delay_base.shape}")
     else:
         delay_base = np.zeros_like(x_for_fx)
         print(f"[Debug Unified Delay] Delay disabled, returning zeros")
@@ -1820,7 +1841,7 @@ def upload():
         try:
             file_size_mb = file_size / (1024 * 1024)
 
-            if file_size_mb > 1.5:  # Skip preview generation for very large files
+            if file_size_mb > 1.0:  # Skip preview generation for large files
                 print(f"[Upload] Large file detected ({file_size_mb:.1f}MB), skipping preview generation to save memory")
 
                 # Get basic audio info without loading the full file
@@ -1829,9 +1850,11 @@ def upload():
                     total_frames = len(f)
                     duration = total_frames / sr
 
-                # Use empty preview data for large files
-                a_mono = np.array([[0.0], [0.0]], dtype=np.float32)  # Minimal stereo data
-                a_ds_mono = np.array([[0.0], [0.0]], dtype=np.float32)
+                # Use minimal valid preview data for large files (proper audio array shape)
+                # Create 1 second of silence in proper stereo format: (frames, channels)
+                preview_frames = int(sr * 1.0)  # 1 second of silence
+                a_mono = np.zeros((preview_frames, 2), dtype=np.float32)  # Proper stereo format
+                a_ds_mono = np.zeros((preview_frames // 2, 2), dtype=np.float32)  # Downsampled
                 sr_ds = sr // 2
 
                 print(f"[Upload] Skipped preview - Duration: {duration:.1f}s, SR: {sr}Hz")
@@ -1975,7 +1998,7 @@ def process_audio():
             file_size = os.path.getsize(temp_path)
             file_size_mb = file_size / (1024 * 1024)
 
-            if file_size_mb > 1.5:  # For files >1.5MB, use emergency fallback
+            if file_size_mb > 1.0:  # For files >1MB, use emergency fallback
                 print(f"[Emergency Fallback] Very large file detected: {file_size_mb:.1f}MB, returning original file")
 
                 # Emergency: Just return the original file without processing to avoid SIGKILL

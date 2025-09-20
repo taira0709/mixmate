@@ -1953,7 +1953,19 @@ def process_audio():
             file_size = os.path.getsize(temp_path)
             file_size_mb = file_size / (1024 * 1024)
 
-            if file_size_mb > 0.5:  # For files >0.5MB, use chunk processing
+            if file_size_mb > 1.5:  # For files >1.5MB, use emergency fallback
+                print(f"[Emergency Fallback] Very large file detected: {file_size_mb:.1f}MB, returning original file")
+
+                # Emergency: Just return the original file without processing to avoid SIGKILL
+                resp = send_file(temp_path, mimetype='audio/wav', as_attachment=True, download_name='MixMate_out.wav')
+
+                # Add basic headers
+                resp.headers['X-EMERGENCY-FALLBACK'] = 'true'
+                resp.headers['X-FILE-SIZE-MB'] = f'{file_size_mb:.1f}'
+
+                return resp
+
+            elif file_size_mb > 0.5:  # For files 0.5-1.5MB, use chunk processing
                 print(f"[Chunk Processing] Large file detected: {file_size_mb:.1f}MB, using chunk processing")
 
                 # Get audio info first

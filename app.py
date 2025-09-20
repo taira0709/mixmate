@@ -2193,22 +2193,49 @@ def process_audio():
         except:
             lufs_out = float('nan')
 
-    buf = io.BytesIO()
-    if mode == 'preview':
-        # プレビューは 32bit float で軽量出力（高速・劣化ほぼなし）
-        sf.write(buf, final, src_sr, format='WAV', subtype='FLOAT')  # ←今度は正常に動作
+    # For large files, use temporary file to avoid memory issues
+    file_size_mb = len(final) * final.itemsize / (1024 * 1024)
+    use_temp_file = file_size_mb > 1.0  # Use temp file for >1MB processed audio
+
+    if use_temp_file:
+        # Use temporary file for large audio
+        output_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+        output_temp_path = output_temp.name
+        output_temp.close()
+
+        print(f"[Large Audio] Using temp file for {file_size_mb:.1f}MB processed audio")
+
+        if mode == 'preview':
+            sf.write(output_temp_path, final, src_sr, format='WAV', subtype='FLOAT')
+        else:
+            sf.write(output_temp_path, final, src_sr, format='WAV', subtype='PCM_16')
+
+        buf = None  # Will use file path instead
     else:
-        # ダウンロードは従来どおり 16bit PCM
-        sf.write(buf, final, src_sr, format='WAV', subtype='PCM_16')
-    buf.seek(0)
+        # Use memory buffer for smaller files
+        buf = io.BytesIO()
+        if mode == 'preview':
+            sf.write(buf, final, src_sr, format='WAV', subtype='FLOAT')
+        else:
+            sf.write(buf, final, src_sr, format='WAV', subtype='PCM_16')
+        buf.seek(0)
+        output_temp_path = None
     # === プレビュー結果キャッシュ保存 ===
     if mode == "preview" and fid and fid in FILES:
         render_cache = FILES[fid].setdefault("render_cache", {})
         # cache_keyは既に正しく計算済み
-        render_cache[cache_key] = buf.getvalue()
+        if use_temp_file:
+            # For temp files, read the content to cache
+            with open(output_temp_path, 'rb') as f:
+                render_cache[cache_key] = f.read()
+        else:
+            render_cache[cache_key] = buf.getvalue()
 
     if mode == 'preview':
-        resp = send_file(io.BytesIO(render_cache[cache_key]), mimetype='audio/wav')
+        if use_temp_file:
+            resp = send_file(output_temp_path, mimetype='audio/wav')
+        else:
+            resp = send_file(io.BytesIO(render_cache[cache_key]), mimetype='audio/wav')
     else:
         # PyWebView環境の検出
         is_pywebview = request.headers.get('User-Agent', '').find('pywebview') != -1
@@ -2216,7 +2243,11 @@ def process_audio():
         if is_pywebview:
             # PyWebView環境の場合はBase64エンコードしてJSONで返す
             import base64
-            audio_data = buf.getvalue()
+            if use_temp_file:
+                with open(output_temp_path, 'rb') as f:
+                    audio_data = f.read()
+            else:
+                audio_data = buf.getvalue()
             audio_b64 = base64.b64encode(audio_data).decode('utf-8')
 
             resp = jsonify({
@@ -2227,7 +2258,10 @@ def process_audio():
             })
         else:
             # 通常のブラウザ環境の場合は従来通り
-            resp = send_file(buf, mimetype='audio/wav', as_attachment=True, download_name='MixMate_out.wav')
+            if use_temp_file:
+                resp = send_file(output_temp_path, mimetype='audio/wav', as_attachment=True, download_name='MixMate_out.wav')
+            else:
+                resp = send_file(buf, mimetype='audio/wav', as_attachment=True, download_name='MixMate_out.wav')
 
     resp.headers['X-GR1-PEAK-DB'] = f'{gr1:.2f}'
     resp.headers['X-GR2-PEAK-DB'] = f'{gr2:.2f}'
@@ -2245,9 +2279,20 @@ def process_audio():
     t1 = time.perf_counter()  # ★終了時間
     print(f"[Profiler] /process: {(t1 - t0) * 1000:.1f}ms")
 
-    # Clean up temporary file after download processing (not for preview)
+    # Clean up temporary files
     if mode == 'download' and fid:
         cleanup_temp_file(fid)
+
+    # Clean up output temp file (after response is sent)
+    if use_temp_file and output_temp_path and os.path.exists(output_temp_path):
+        try:
+            # For preview mode, keep temp file for potential reuse
+            # For download mode, schedule cleanup after response
+            if mode == 'download':
+                import atexit
+                atexit.register(lambda: os.remove(output_temp_path) if os.path.exists(output_temp_path) else None)
+        except Exception as e:
+            print(f"[Cleanup] Warning: Could not schedule temp file cleanup: {e}")
 
     return resp
 

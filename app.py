@@ -1821,7 +1821,10 @@ def upload():
                 max_frames = int(44100 * 30)  # Assume 44.1kHz, 30 seconds max
                 print(f"[Upload] Large file detected, limiting preview to 30 seconds")
 
-            a, sr = sf.read(temp_path, dtype='float32', always_2d=True, frames=max_frames)
+            if max_frames is not None:
+                a, sr = sf.read(temp_path, dtype='float32', always_2d=True, frames=max_frames)
+            else:
+                a, sr = sf.read(temp_path, dtype='float32', always_2d=True)
             a = to_stereo(a)
 
             # Generate lightweight preview versions only
